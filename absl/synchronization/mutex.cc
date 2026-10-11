@@ -535,6 +535,7 @@ struct SynchWaitParams {
 struct SynchLocksHeld {
   int n;          // number of valid entries in locks[]
   bool overflow;  // true iff we overflowed the array at some point
+  bool edge_cache_initialized;
   struct {
     Mutex* mu;      // lock acquired
     int32_t count;  // times acquired
@@ -551,6 +552,24 @@ struct SynchLocksHeld {
   // continue, discarding information as needed.  If no overflow has
   // taken place, we can provide more error checking, such as
   // detecting when a thread releases a lock it does not hold.
+
+  // Direct-mapped cache of lock-order edges (from -> to) that this thread
+  // found or inserted in deadlock_graph, so that DeadlockCheck() can skip
+  // deadlock_graph_mu when all the edges it would insert are cached. An entry
+  // is valid while deadlock_graph still has both nodes (see
+  // GraphCycles::IsCurrent()). It covers acquisitions at lock depths up to
+  // priority, since a stack trace of at least that priority is recorded for
+  // `to`.
+  static constexpr size_t kEdgeCacheSize = 512;
+  struct CachedEdge {
+    uintptr_t from_masked;  // base_internal::HidePtr(from)
+    uintptr_t to_masked;    // base_internal::HidePtr(to)
+    GraphId from_id;
+    GraphId to_id;
+    const void* from_node;  // GraphCycles::GetNodeHandle(from_id)
+    const void* to_node;    // GraphCycles::GetNodeHandle(to_id)
+    int priority;
+  } edge_cache[kEdgeCacheSize];
 };
 
 // A sentinel value in lists that is not 0.
@@ -563,6 +582,7 @@ static SynchLocksHeld* LocksHeldAlloc() {
       base_internal::LowLevelAlloc::Alloc(sizeof(SynchLocksHeld)));
   ret->n = 0;
   ret->overflow = false;
+  ret->edge_cache_initialized = false;
   return ret;
 }
 
@@ -1250,6 +1270,45 @@ PerThreadSynch* Mutex::Wakeup(PerThreadSynch* w) {
   return next;
 }
 
+// Counts of deadlock_graph nodes per hash bucket of Mutex addresses, so that
+// ForgetDeadlockInfo() can skip deadlock_graph_mu when the bucket of a Mutex
+// is empty. Most Mutexes never get a node, since they are never held while
+// another lock is acquired. Each word holds four 8-bit counts, which are
+// modified only under deadlock_graph_mu but read without it. A count that
+// reaches 255 stays there, so its bucket is never treated as empty again.
+constexpr int kDeadlockNodeBucketBits = 18;
+ABSL_CONST_INIT static std::atomic<uint32_t>
+    deadlock_node_bucket_counts[(size_t{1} << kDeadlockNodeBucketBits) / 4];
+
+namespace {
+struct DeadlockNodeBucket {
+  std::atomic<uint32_t>* word;
+  int shift;  // Bit offset of the count within *word.
+
+  explicit DeadlockNodeBucket(const Mutex* mu) {
+    const uint64_t h =
+        uint64_t{reinterpret_cast<uintptr_t>(mu)} * 0x9e3779b97f4a7c15ULL;
+    const size_t i = static_cast<size_t>(h >> (64 - kDeadlockNodeBucketBits));
+    word = &deadlock_node_bucket_counts[i / 4];
+    shift = static_cast<int>(i % 4) * 8;
+  }
+
+  bool IsEmpty() const {
+    return ((word->load(std::memory_order_relaxed) >> shift) & 0xff) == 0;
+  }
+
+  // Adds 1 to (if increment) or subtracts 1 from the count, unless it is
+  // saturated.
+  void Update(bool increment) const
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(deadlock_graph_mu) {
+    const uint32_t w = word->load(std::memory_order_relaxed);
+    if (((w >> shift) & 0xff) == 0xff) return;
+    const uint32_t one = uint32_t{1} << shift;
+    word->store(increment ? w + one : w - one, std::memory_order_relaxed);
+  }
+};
+}  // namespace
+
 static GraphId GetGraphIdLocked(Mutex* mu)
     ABSL_EXCLUSIVE_LOCKS_REQUIRED(deadlock_graph_mu) {
   if (!deadlock_graph) {  // (re)create the deadlock graph.
@@ -1257,7 +1316,18 @@ static GraphId GetGraphIdLocked(Mutex* mu)
         new (base_internal::LowLevelAlloc::Alloc(sizeof(*deadlock_graph)))
             GraphCycles;
   }
-  return deadlock_graph->GetId(mu);
+  bool is_new = false;
+  const GraphId id = deadlock_graph->GetId(mu, &is_new);
+  if (is_new) DeadlockNodeBucket(mu).Update(/*increment=*/true);
+  return id;
+}
+
+// Returns the SynchLocksHeld::edge_cache slot for the edge from -> to.
+static size_t EdgeCacheIndex(const Mutex* from, const Mutex* to) {
+  const uint64_t a = reinterpret_cast<uintptr_t>(from);
+  const uint64_t b = reinterpret_cast<uintptr_t>(to);
+  const uint64_t h = (a * 0x9e3779b97f4a7c15ULL) ^ (b * 0xbf58476d1ce4e5b9ULL);
+  return static_cast<size_t>((h >> 32) & (SynchLocksHeld::kEdgeCacheSize - 1));
 }
 
 // Returns the index of the entry for mu in held_locks, or -1 if there is none.
@@ -1399,15 +1469,6 @@ int GetStack(void** stack, int max_depth) {
 }
 }  // anonymous namespace
 
-// Returns true iff held_locks has an entry that counts for lock ordering, that
-// is, one that is not marked forgotten.
-static bool HoldsUnforgottenLock(const SynchLocksHeld* held_locks) {
-  for (int i = 0; i != held_locks->n; i++) {
-    if (!held_locks->locks[i].forgotten) return true;
-  }
-  return false;
-}
-
 // Looks up ids for the entries in held_locks that are not marked forgotten and
 // do not have a current id, because this thread has not needed it yet, or
 // because another thread called ForgetDeadlockInfo() on that Mutex.
@@ -1432,13 +1493,53 @@ static void DeadlockCheck(Mutex* mu) {
 
   SynchLocksHeld* all_locks = Synch_GetAllLocks();
 
-  if (!HoldsUnforgottenLock(all_locks)) {
+  // Entries marked forgotten do not count for lock ordering. Check whether
+  // every edge from a held lock to mu is already in deadlock_graph, according
+  // to this thread's edge cache.
+  bool holds_lock = false;
+  bool all_cached = all_locks->edge_cache_initialized;
+  const int priority = all_locks->n + 1;
+  const uintptr_t mu_masked = base_internal::HidePtr(mu);
+  for (int i = 0; i != all_locks->n; i++) {
+    if (all_locks->locks[i].forgotten) continue;
+    holds_lock = true;
+    if (!all_cached) break;
+    const Mutex* other = all_locks->locks[i].mu;
+    const SynchLocksHeld::CachedEdge& c =
+        all_locks->edge_cache[EdgeCacheIndex(other, mu)];
+    if (c.from_masked != base_internal::HidePtr(other) ||
+        c.to_masked != mu_masked || c.priority < priority ||
+        (all_locks->locks[i].id != InvalidGraphId() &&
+         all_locks->locks[i].id != c.from_id) ||
+        !GraphCycles::IsCurrent(c.from_node, c.from_id) ||
+        !GraphCycles::IsCurrent(c.to_node, c.to_id)) {
+      all_cached = false;
+      break;
+    }
+  }
+  if (!holds_lock) {
     // There are no other locks held, so there are no edges to add. Return now
     // so that we don't need to take deadlock_graph_mu or call GetSynchEvent().
     // This way we do not record the stack trace for this Mutex. It's ok, since
     // if this Mutex is involved in a deadlock, it can't always be the first
     // lock acquired by a thread.
     return;
+  }
+  if (all_cached) {
+    // Record the ids of held locks, as the code below would.
+    for (int i = 0; i != all_locks->n; i++) {
+      if (!all_locks->locks[i].forgotten &&
+          all_locks->locks[i].id == InvalidGraphId()) {
+        all_locks->locks[i].id =
+            all_locks->edge_cache[EdgeCacheIndex(all_locks->locks[i].mu, mu)]
+                .from_id;
+      }
+    }
+    return;
+  }
+  if (!all_locks->edge_cache_initialized) {
+    memset(all_locks->edge_cache, 0, sizeof(all_locks->edge_cache));
+    all_locks->edge_cache_initialized = true;
   }
 
   absl::base_internal::SpinLockHolder lock(deadlock_graph_mu);
@@ -1453,7 +1554,7 @@ static void DeadlockCheck(Mutex* mu) {
   // as many locks as possible.  This increases the chances that a given edge
   // in the acquires-before graph will be represented in the stack traces
   // recorded for the locks.
-  deadlock_graph->UpdateStackTrace(mu_id, all_locks->n + 1, GetStack);
+  deadlock_graph->UpdateStackTrace(mu_id, priority, GetStack);
 
   // For each other mutex already held by this thread:
   for (int i = 0; i != all_locks->n; i++) {
@@ -1516,6 +1617,22 @@ static void DeadlockCheck(Mutex* mu) {
       }
       break;  // report at most one potential deadlock per acquisition
     }
+
+    // The edge is in deadlock_graph, and a stack trace of at least this
+    // priority is recorded for mu. Remember that in the edge cache.
+    const uintptr_t other_masked = base_internal::HidePtr(other);
+    SynchLocksHeld::CachedEdge& c =
+        all_locks->edge_cache[EdgeCacheIndex(other, mu)];
+    const bool same_edge = c.from_masked == other_masked &&
+                           c.to_masked == mu_masked &&
+                           c.from_id == other_node_id && c.to_id == mu_id;
+    c = {other_masked,
+         mu_masked,
+         other_node_id,
+         mu_id,
+         deadlock_graph->GetNodeHandle(other_node_id),
+         deadlock_graph->GetNodeHandle(mu_id),
+         same_edge && c.priority > priority ? c.priority : priority};
   }
 }
 
@@ -1544,9 +1661,14 @@ void Mutex::ForgetDeadlockInfo() {
         held_locks->locks[i].forgotten = true;
       }
     }
+    // A node for this Mutex is created by a DeadlockCheck() call that
+    // happens-before this call, unless the two race (which would also race
+    // with the removal below), so then its bucket is not empty here.
+    const DeadlockNodeBucket bucket(this);
+    if (bucket.IsEmpty()) return;
     deadlock_graph_mu.lock();
-    if (deadlock_graph != nullptr) {
-      deadlock_graph->RemoveNode(this);
+    if (deadlock_graph != nullptr && deadlock_graph->RemoveNode(this)) {
+      bucket.Update(/*increment=*/false);
     }
     deadlock_graph_mu.unlock();
   }

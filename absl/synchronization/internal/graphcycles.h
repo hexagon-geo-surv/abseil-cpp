@@ -66,12 +66,13 @@ class GraphCycles {
 
   // Return the id to use for ptr, assigning one if necessary.
   // Subsequent calls with the same ptr value will return the same id
-  // until Remove().
-  GraphId GetId(void* ptr);
+  // until Remove(). If is_new is non-null, *is_new is set to whether a new id
+  // was assigned.
+  GraphId GetId(void* ptr, bool* is_new = nullptr);
 
-  // Remove "ptr" from the graph.  Its corresponding node and all
-  // edges to and from it are removed.
-  void RemoveNode(void* ptr);
+  // Remove "ptr" from the graph, if present.  Its corresponding node and all
+  // edges to and from it are removed. Returns whether a node was removed.
+  bool RemoveNode(void* ptr);
 
   // Return the pointer associated with id, or nullptr if id is not
   // currently in the graph.
@@ -87,6 +88,17 @@ class GraphCycles {
 
   // Return whether node exists in the graph.
   bool HasNode(GraphId node);
+
+  // Return an opaque handle to node for use with IsCurrent(), or nullptr if
+  // node is not in the graph. The handle remains usable for the lifetime of
+  // this GraphCycles.
+  const void* GetNodeHandle(GraphId node);
+
+  // Return whether node, whose handle was returned by GetNodeHandle(node), is
+  // still in the graph. Unlike the other methods, this may be called without
+  // external serialization. Its result then reflects at least every
+  // RemoveNode() call that happens-before it.
+  static bool IsCurrent(const void* node_handle, GraphId node);
 
   // Return whether there is an edge directly from source_node to dest_node.
   bool HasEdge(GraphId x, GraphId y) const;

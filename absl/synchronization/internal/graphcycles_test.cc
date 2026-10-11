@@ -644,6 +644,44 @@ TEST(GraphCycles, RanksRunOut) {
   CheckInvariants(g);
 }
 
+TEST(GraphCycles, GetIdIsNewAndRemoveNodeResult) {
+  GraphCycles g;
+  int a = 0;
+  bool is_new = false;
+  EXPECT_FALSE(g.RemoveNode(&a));
+
+  const GraphId id1 = g.GetId(&a, &is_new);
+  EXPECT_TRUE(is_new);
+  EXPECT_EQ(g.GetId(&a, &is_new), id1);
+  EXPECT_FALSE(is_new);
+
+  EXPECT_TRUE(g.RemoveNode(&a));
+  EXPECT_FALSE(g.RemoveNode(&a));
+
+  EXPECT_NE(g.GetId(&a, &is_new), id1);
+  EXPECT_TRUE(is_new);
+}
+
+TEST(GraphCycles, NodeHandles) {
+  GraphCycles g;
+  int a = 0;
+  const GraphId id1 = g.GetId(&a);
+  const void* handle = g.GetNodeHandle(id1);
+  ASSERT_NE(handle, nullptr);
+  EXPECT_TRUE(GraphCycles::IsCurrent(handle, id1));
+
+  g.RemoveNode(&a);
+  EXPECT_FALSE(GraphCycles::IsCurrent(handle, id1));
+  EXPECT_EQ(g.GetNodeHandle(id1), nullptr);
+
+  // The next node reuses the removed node's slot, and so its handle.
+  const GraphId id2 = g.GetId(&a);
+  EXPECT_NE(id2, id1);
+  EXPECT_EQ(g.GetNodeHandle(id2), handle);
+  EXPECT_TRUE(GraphCycles::IsCurrent(handle, id2));
+  EXPECT_FALSE(GraphCycles::IsCurrent(handle, id1));
+}
+
 }  // namespace synchronization_internal
 ABSL_NAMESPACE_END
 }  // namespace absl
