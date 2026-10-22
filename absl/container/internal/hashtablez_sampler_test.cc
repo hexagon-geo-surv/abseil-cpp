@@ -27,6 +27,8 @@
 #include "gtest/gtest.h"
 #include "absl/base/attributes.h"
 #include "absl/base/config.h"
+#include "absl/base/optimization.h"
+#include "absl/container/internal/container_memory.h"
 #include "absl/profiling/internal/sample_recorder.h"
 #include "absl/random/random.h"
 #include "absl/synchronization/blocking_counter.h"
@@ -61,6 +63,24 @@ namespace {
 using ::absl::synchronization_internal::ThreadPool;
 using ::testing::IsEmpty;
 using ::testing::UnorderedElementsAre;
+
+// Returns a sampling handle.
+HashtablezInfoHandle Sample(size_t inline_element_size, size_t key_size,
+                            size_t value_size, uint16_t soo_capacity) {
+  if (ABSL_PREDICT_TRUE(!ShouldSampleNextTable())) {
+    return HashtablezInfoHandle(nullptr);
+  }
+  const HashtableTypeInfo info = {
+      static_cast<uint32_t>(inline_element_size),
+      /*slot_align_mask=*/0,  // Unused by sampling.
+      /*soo_enabled=*/soo_capacity != 0,
+      /*is_hashtablez_enabled=*/true,
+      /*alloc_offset=*/0,  // Unused by sampling.
+      static_cast<uint32_t>(key_size),
+      static_cast<uint32_t>(value_size),
+  };
+  return ForcedTrySample(info);
+}
 
 std::vector<size_t> GetSizes(HashtablezSampler* s) {
   std::vector<size_t> res;

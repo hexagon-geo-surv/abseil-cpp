@@ -128,7 +128,7 @@ TEST(RawHashSetLayout, SmallCapacity) {
   {
     SCOPED_TRACE("capacity=1 no alignment after generation");
     constexpr size_t kSlotSize = 1;
-    RawHashSetLayout layout(1, kSlotSize, /*slot_align=*/1,
+    RawHashSetLayout layout(1, kSlotSize, /*slot_align_mask=*/0,
                             /*has_infoz=*/false, /*blocked_element_count=*/0);
     EXPECT_EQ(layout.control_offset(), NumGenerationBytes());
     EXPECT_EQ(layout.slot_offset(), NumGenerationBytes());
@@ -138,7 +138,7 @@ TEST(RawHashSetLayout, SmallCapacity) {
     SCOPED_TRACE("capacity=1 with alignment after generation");
     constexpr size_t kSlotSize = 8;
     constexpr size_t kAlignment = 4;
-    RawHashSetLayout layout(1, kSlotSize, kAlignment,
+    RawHashSetLayout layout(1, kSlotSize, /*slot_align_mask=*/kAlignment - 1,
                             /*has_infoz=*/false, /*blocked_element_count=*/0);
     EXPECT_EQ(layout.control_offset(),
               NumGenerationBytes() == 0 ? 0 : kAlignment);
@@ -152,11 +152,13 @@ TEST(RawHashSetLayout, CreateForSmallNonSooGrowth) {
     for (size_t slot_align : {1u, 2u, 4u, 8u, 16u}) {
       for (size_t slot_size : {slot_align, slot_align * 2, slot_align * 3}) {
         for (bool has_infoz : {false, true}) {
-          RawHashSetLayout expected(NextCapacity(size), slot_size, slot_align,
+          RawHashSetLayout expected(NextCapacity(size), slot_size,
+                                    /*slot_align_mask=*/slot_align - 1,
                                     has_infoz, /*blocked_element_count=*/0);
           RawHashSetLayout actual =
               RawHashSetLayout::CreateForSmallNonSooGrowth(
-                  size, slot_size, slot_align, has_infoz);
+                  size, slot_size, /*slot_align_mask=*/slot_align - 1,
+                  has_infoz);
           EXPECT_EQ(actual.control_offset(), expected.control_offset());
           EXPECT_EQ(actual.generation_offset(), expected.generation_offset());
           EXPECT_EQ(actual.slot_offset(), expected.slot_offset());
@@ -178,7 +180,8 @@ void VerifyMiddleSizeTableLayout(size_t capacity, size_t slot_size,
                << " padding: " << padding);
   ASSERT_GT(capacity, 1);
   ASSERT_LE(capacity, GrowthInfoLowerBound::kMaxGrowthLeftLowerBound);
-  RawHashSetLayout layout(capacity, slot_size, slot_align, has_infoz,
+  RawHashSetLayout layout(capacity, slot_size,
+                          /*slot_align_mask=*/slot_align - 1, has_infoz,
                           blocked_element_count);
   EXPECT_EQ(layout.control_offset(), padding + NumGenerationBytes());
   size_t expected_slot_offset =
@@ -214,7 +217,7 @@ TEST(RawHashSetLayout, MiddleSize) {
 TEST(RawHashSetLayout, SmallWithInfoZ) {
   {
     SCOPED_TRACE("capacity=1 no alignment after generation");
-    RawHashSetLayout layout(1, /*slot_size=*/1, /*slot_align=*/1,
+    RawHashSetLayout layout(1, /*slot_size=*/1, /*slot_align_mask=*/0,
                             /*has_infoz=*/true, /*blocked_element_count=*/0);
     EXPECT_EQ(layout.control_offset(),
               // growth_info is always 8 bytes for sampled tables.
@@ -227,7 +230,7 @@ TEST(RawHashSetLayout, SmallWithInfoZ) {
     constexpr size_t kAlignment = 8;
     constexpr size_t kCapacity = 3;
     RawHashSetLayout layout(kCapacity, /*slot_size=*/kSlotSize,
-                            /*slot_align=*/kAlignment,
+                            /*slot_align_mask=*/kAlignment - 1,
                             /*has_infoz=*/true, /*blocked_element_count=*/0);
     size_t padding = NumGenerationBytes() == 0 ? 1 : 0;
     padding += sizeof(HashtablezInfoHandle) == 4 ? 0 : 4;
@@ -253,7 +256,8 @@ void VerifyLargeTableLayout(size_t capacity, size_t slot_size,
                << " slot_align: " << slot_align << " has_infoz: " << has_infoz
                << " blocked_element_count: " << blocked_element_count);
   ASSERT_GT(capacity, GrowthInfoLowerBound::kMaxGrowthLeftLowerBound);
-  RawHashSetLayout layout(capacity, slot_size, slot_align, has_infoz,
+  RawHashSetLayout layout(capacity, slot_size,
+                          /*slot_align_mask=*/slot_align - 1, has_infoz,
                           blocked_element_count);
   size_t padding = NumGenerationBytes() == 0 ? 1 : 0;
   EXPECT_EQ(layout.control_offset(),
@@ -4115,7 +4119,7 @@ TYPED_TEST(RawHashSamplerTest, Sample) {
   // Enable the feature even if the prod default is off.
   SetSamplingRateTo1Percent();
 
-  ASSERT_EQ(TypeParam().capacity(), soo_enabled ? SooCapacity() : 0);
+  ASSERT_EQ(TypeParam().capacity(), soo_enabled ? HashtableSooCapacity() : 0);
 
   auto& sampler = GlobalHashtablezSampler();
   size_t start_size = 0;
@@ -4161,7 +4165,7 @@ TYPED_TEST(RawHashSamplerTest, Sample) {
     EXPECT_EQ(info.value_size, sizeof(typename TypeParam::value_type));
 
     if (soo_enabled) {
-      EXPECT_EQ(info.soo_capacity, SooCapacity());
+      EXPECT_EQ(info.soo_capacity, HashtableSooCapacity());
     } else {
       EXPECT_EQ(info.soo_capacity, 0);
     }
@@ -4226,7 +4230,7 @@ std::vector<const HashtablezInfo*> SampleNonSooMutation(
 }
 
 TEST(RawHashSamplerTest, SooTableInsertToEmpty) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -4236,8 +4240,8 @@ TEST(RawHashSamplerTest, SooTableInsertToEmpty) {
   for (const HashtablezInfo* info : infos) {
     ASSERT_EQ(info->inline_element_size,
               sizeof(typename SooInt32Table::value_type));
-    ASSERT_EQ(info->soo_capacity, SooCapacity());
-    ASSERT_EQ(info->capacity, NextCapacity(SooCapacity()));
+    ASSERT_EQ(info->soo_capacity, HashtableSooCapacity());
+    ASSERT_EQ(info->capacity, NextCapacity(HashtableSooCapacity()));
     ASSERT_EQ(info->size, 1);
     ASSERT_EQ(info->max_reserve, 0);
     ASSERT_EQ(info->num_erases, 0);
@@ -4267,7 +4271,7 @@ TEST(RawHashSamplerTest, NonSooTableInsertToEmpty) {
 // the sampling decision to be evaluated multiple times, preventing
 // oversampling.
 TEST(RawHashSamplerTest, SooTableRepeatedInsertEraseDoesNotOversample) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -4322,7 +4326,7 @@ TEST(RawHashSamplerTest, NonSooTableRepeatedInsertClearCountSizeRight) {
 // Verifies that copy-constructing or copy-assigning an SOO table does not
 // incorrectly trigger new sampling evaluations.
 TEST(RawHashSamplerTest, SooTableCopyDoesNotOversample) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -4342,7 +4346,7 @@ TEST(RawHashSamplerTest, SooTableCopyDoesNotOversample) {
 // Verifies that move-constructing or move-assigning an SOO table correctly
 // transfers the sampling state and does not trigger oversampling.
 TEST(RawHashSamplerTest, SooTableMoveDoesNotOversample) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -4360,7 +4364,7 @@ TEST(RawHashSamplerTest, SooTableMoveDoesNotOversample) {
 }
 
 TEST(RawHashSamplerTest, SooTableReserveToEmpty) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -4370,7 +4374,7 @@ TEST(RawHashSamplerTest, SooTableReserveToEmpty) {
   for (const HashtablezInfo* info : infos) {
     ASSERT_EQ(info->inline_element_size,
               sizeof(typename SooInt32Table::value_type));
-    ASSERT_EQ(info->soo_capacity, SooCapacity());
+    ASSERT_EQ(info->soo_capacity, HashtableSooCapacity());
     ASSERT_GE(info->capacity, 100);
     ASSERT_EQ(info->size, 0);
     ASSERT_EQ(info->max_reserve, 100);
@@ -4383,7 +4387,7 @@ TEST(RawHashSamplerTest, SooTableReserveToEmpty) {
 // This tests that reserve on a full SOO table doesn't incorrectly result in new
 // (over-)sampling.
 TEST(RawHashSamplerTest, SooTableReserveToFullSoo) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -4396,7 +4400,7 @@ TEST(RawHashSamplerTest, SooTableReserveToFullSoo) {
   for (const HashtablezInfo* info : infos) {
     ASSERT_EQ(info->inline_element_size,
               sizeof(typename SooInt32Table::value_type));
-    ASSERT_EQ(info->soo_capacity, SooCapacity());
+    ASSERT_EQ(info->soo_capacity, HashtableSooCapacity());
     ASSERT_GE(info->capacity, 100);
     ASSERT_EQ(info->size, 1);
     ASSERT_EQ(info->max_reserve, 100);
@@ -4407,7 +4411,7 @@ TEST(RawHashSamplerTest, SooTableReserveToFullSoo) {
 }
 
 TEST(RawHashSamplerTest, SooTableSampleOnCopy) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -4421,8 +4425,8 @@ TEST(RawHashSamplerTest, SooTableSampleOnCopy) {
   for (const HashtablezInfo* info : infos) {
     ASSERT_EQ(info->inline_element_size,
               sizeof(typename SooInt32Table::value_type));
-    ASSERT_EQ(info->soo_capacity, SooCapacity());
-    ASSERT_EQ(info->capacity, NextCapacity(SooCapacity()));
+    ASSERT_EQ(info->soo_capacity, HashtableSooCapacity());
+    ASSERT_EQ(info->capacity, NextCapacity(HashtableSooCapacity()));
     ASSERT_EQ(info->size, 1);
   }
 }
@@ -4446,7 +4450,7 @@ TEST(RawHashSamplerTest, NonSooTableSampleOnCopy) {
 // This tests that rehash(0) on a sampled table with size that fits in SOO
 // doesn't incorrectly result in losing sampling.
 TEST(RawHashSamplerTest, SooTableRehashShrinkWhenSizeFitsInSoo) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -4461,8 +4465,8 @@ TEST(RawHashSamplerTest, SooTableRehashShrinkWhenSizeFitsInSoo) {
   for (const HashtablezInfo* info : infos) {
     ASSERT_EQ(info->inline_element_size,
               sizeof(typename SooInt32Table::value_type));
-    ASSERT_EQ(info->soo_capacity, SooCapacity());
-    ASSERT_EQ(info->capacity, NextCapacity(SooCapacity()));
+    ASSERT_EQ(info->soo_capacity, HashtableSooCapacity());
+    ASSERT_EQ(info->capacity, NextCapacity(HashtableSooCapacity()));
     ASSERT_EQ(info->size, 1);
     ASSERT_EQ(info->max_reserve, 100);
     ASSERT_EQ(info->num_erases, 0);
@@ -4475,7 +4479,7 @@ TEST(RawHashSamplerTest, SooTableRehashShrinkWhenSizeFitsInSoo) {
 // original table, allowing it to be used without incorrectly updating global
 // sampling stats.
 TEST(RawHashSamplerTest, MovedFromTableIsNotSampled) {
-  if (SooInt32Table().capacity() != SooCapacity()) {
+  if (SooInt32Table().capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -5038,7 +5042,7 @@ TEST(SooTable, Basic) {
   bool frozen = true;
   FreezableSizedValueSooTable<8> t{
       FreezableAlloc<FreezableSizedValueSooTable<8>::value_type>(&frozen)};
-  if (t.capacity() != SooCapacity()) {
+  if (t.capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -5067,7 +5071,7 @@ TEST(SooTable, Basic) {
 
 TEST(Table, RehashToSooUnsampled) {
   SooIntTable t;
-  if (t.capacity() != SooCapacity()) {
+  if (t.capacity() != HashtableSooCapacity()) {
     CHECK_LT(sizeof(void*), 8) << "missing SOO coverage";
     GTEST_SKIP() << "not SOO on this platform";
   }
@@ -5082,7 +5086,7 @@ TEST(Table, RehashToSooUnsampled) {
 
   t.rehash(0);  // Rehash back down to SOO table.
 
-  EXPECT_EQ(t.capacity(), SooCapacity());
+  EXPECT_EQ(t.capacity(), HashtableSooCapacity());
   EXPECT_EQ(t.size(), 1);
   EXPECT_EQ(*t.begin(), 0);
   EXPECT_EQ(t.find(0), t.begin());
