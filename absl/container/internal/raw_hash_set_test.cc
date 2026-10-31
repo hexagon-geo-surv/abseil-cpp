@@ -1391,6 +1391,29 @@ TEST(Table, EmptyFunctorOptimization) {
                        std::equal_to<absl::string_view>, std::allocator<int>>));
 }
 
+TEST(Table, StandardLayout) {
+  struct StatelessHash {
+    size_t operator()(absl::string_view) const { return 0; }
+  };
+  struct StatefulHash : StatelessHash {
+    uint64_t dummy;
+  };
+
+  EXPECT_TRUE(std::is_standard_layout_v<raw_hash_set<IntPolicy>>);
+  EXPECT_TRUE(
+      (std::is_standard_layout_v<raw_hash_set<StringPolicy, StatelessHash,
+                                              std::equal_to<absl::string_view>,
+                                              std::allocator<int>>>));
+  EXPECT_TRUE(
+      (std::is_standard_layout_v<raw_hash_set<StringPolicy, StatefulHash,
+                                              std::equal_to<absl::string_view>,
+                                              std::allocator<int>>>));
+  EXPECT_TRUE(std::is_standard_layout_v<IntTable>);
+  EXPECT_TRUE(std::is_standard_layout_v<SooIntTable>);
+  EXPECT_TRUE(std::is_standard_layout_v<NonSooIntTable>);
+  EXPECT_TRUE(std::is_standard_layout_v<ChangingSizeAllocIntTable>);
+}
+
 TEST(InstantiateRawHashSetTest, VerifyTypes) {
   using P = ValuePolicy<int>;
   using DA = typename P::DefaultHash;
