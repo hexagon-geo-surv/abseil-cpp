@@ -31,6 +31,7 @@
 #include "absl/base/no_destructor.h"
 #include "absl/container/internal/test_instance_tracker.h"
 #include "absl/functional/overload.h"
+#include "absl/hash/hash.h"
 #include "absl/meta/type_traits.h"
 #include "absl/strings/string_view.h"
 
@@ -329,6 +330,77 @@ TEST(ApplyTest, TypeErasedApplyToSlotFn) {
                 fn, seed)(x)));
 }
 
+TEST(ApplyTest, GetTypeErasedApplyToSlotFnCanonicalizesTypes) {
+  enum class MyEnum : uint32_t { kOne = 1, kTwo = 2 };
+  int32_t a = 1;
+  uint32_t b = 2;
+  MyEnum c = MyEnum::kTwo;
+  int* a_ptr = &a;
+  uint32_t* b_ptr = &b;
+  size_t seed = 100;
+  HashSlotFn fn_int32 =
+      GetTypeErasedApplyToSlotFn<absl::Hash<int32_t>, int32_t,
+                                 /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_uint32 =
+      GetTypeErasedApplyToSlotFn<absl::Hash<uint32_t>, uint32_t,
+                                 /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_enum =
+      GetTypeErasedApplyToSlotFn<absl::Hash<MyEnum>, MyEnum,
+                                 /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_uintptr =
+      GetTypeErasedApplyToSlotFn<absl::Hash<uintptr_t>, uintptr_t,
+                                 /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_int_ptr =
+      GetTypeErasedApplyToSlotFn<absl::Hash<int*>, int*,
+                                 /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_uint32_ptr =
+      GetTypeErasedApplyToSlotFn<absl::Hash<uint32_t*>, uint32_t*,
+                                 /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_transparent_int32 = GetTypeErasedApplyToSlotFn<
+      absl::TransparentHash<int32_t, int64_t>, int32_t,
+      /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_transparent_converted =
+      GetTypeErasedApplyToSlotFn<absl::TransparentHash<int64_t>, int32_t,
+                                 /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  struct DerivedHash : absl::Hash<int32_t> {
+    size_t operator()(int32_t v) const { return static_cast<size_t>(v + 42); }
+  } derived_hash;
+  HashSlotFn fn_derived =
+      GetTypeErasedApplyToSlotFn<DerivedHash, int32_t,
+                                 /*kIsAbsl=*/false, /*kSeedShift=*/0>();
+  EXPECT_EQ(fn_int32, fn_uint32);
+  EXPECT_EQ(fn_int32, fn_enum);
+  EXPECT_EQ(fn_int32, fn_transparent_int32);
+  EXPECT_NE(fn_int32, fn_transparent_converted);
+  EXPECT_NE(fn_int32, fn_derived);
+  EXPECT_EQ(fn_uintptr, fn_int_ptr);
+  EXPECT_EQ(fn_int_ptr, fn_uint32_ptr);
+  EXPECT_EQ(
+      fn_derived(&derived_hash, &a, seed),
+      (HashElement<DerivedHash, /*kIsAbsl=*/false, /*kSeedShift=*/0>(
+          derived_hash, seed)(a)));
+  EXPECT_EQ(
+      fn_int32(nullptr, &a, seed),
+      (HashElement<absl::Hash<int32_t>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<int32_t>{}, seed)(a)));
+  EXPECT_EQ(
+      fn_uint32(nullptr, &b, seed),
+      (HashElement<absl::Hash<uint32_t>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<uint32_t>{}, seed)(b)));
+  EXPECT_EQ(
+      fn_enum(nullptr, &c, seed),
+      (HashElement<absl::Hash<MyEnum>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<MyEnum>{}, seed)(c)));
+  EXPECT_EQ(
+      fn_int_ptr(nullptr, &a_ptr, seed),
+      (HashElement<absl::Hash<int*>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<int*>{}, seed)(a_ptr)));
+  EXPECT_EQ(
+      fn_uint32_ptr(nullptr, &b_ptr, seed),
+      (HashElement<absl::Hash<uint32_t*>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<uint32_t*>{}, seed)(b_ptr)));
+}
+
 TEST(ApplyTest, TypeErasedDerefAndApplyToSlotFn) {
   size_t x = 7;
   size_t seed = 100;
@@ -340,6 +412,80 @@ TEST(ApplyTest, TypeErasedDerefAndApplyToSlotFn) {
                                        /*kSeedShift=*/0>(&fn, &x_ptr, seed)),
       (HashElement<decltype(fn), /*kIsAbsl=*/false, /*kSeedShift=*/0>(
           fn, seed)(x)));
+}
+
+TEST(ApplyTest, GetTypeErasedDerefAndApplyToSlotFnCanonicalizesTypes) {
+  enum class MyEnum : uint32_t { kOne = 1, kTwo = 2 };
+  int32_t a = 1;
+  uint32_t b = 2;
+  MyEnum c = MyEnum::kTwo;
+  int32_t* a_ptr = &a;
+  uint32_t* b_ptr = &b;
+  MyEnum* c_ptr = &c;
+  int32_t** a_ptr_ptr = &a_ptr;
+  uint32_t** b_ptr_ptr = &b_ptr;
+  size_t seed = 100;
+  HashSlotFn fn_int32 =
+      GetTypeErasedDerefAndApplyToSlotFn<absl::Hash<int32_t>, int32_t,
+                                         /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_uint32 =
+      GetTypeErasedDerefAndApplyToSlotFn<absl::Hash<uint32_t>, uint32_t,
+                                         /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_enum =
+      GetTypeErasedDerefAndApplyToSlotFn<absl::Hash<MyEnum>, MyEnum,
+                                         /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_uintptr =
+      GetTypeErasedDerefAndApplyToSlotFn<absl::Hash<uintptr_t>, uintptr_t,
+                                         /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_int_ptr =
+      GetTypeErasedDerefAndApplyToSlotFn<absl::Hash<int32_t*>, int32_t*,
+                                         /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_uint32_ptr =
+      GetTypeErasedDerefAndApplyToSlotFn<absl::Hash<uint32_t*>, uint32_t*,
+                                         /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_transparent_int32 = GetTypeErasedDerefAndApplyToSlotFn<
+      absl::TransparentHash<int32_t, int64_t>, int32_t,
+      /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  HashSlotFn fn_transparent_converted = GetTypeErasedDerefAndApplyToSlotFn<
+      absl::TransparentHash<int64_t>, int32_t,
+      /*kIsAbsl=*/true, /*kSeedShift=*/0>();
+  struct DerivedHash : absl::Hash<int32_t> {
+    size_t operator()(int32_t v) const { return static_cast<size_t>(v + 42); }
+  } derived_hash;
+  HashSlotFn fn_derived =
+      GetTypeErasedDerefAndApplyToSlotFn<DerivedHash, int32_t,
+                                         /*kIsAbsl=*/false, /*kSeedShift=*/0>();
+  EXPECT_EQ(fn_int32, fn_uint32);
+  EXPECT_EQ(fn_int32, fn_enum);
+  EXPECT_EQ(fn_int32, fn_transparent_int32);
+  EXPECT_NE(fn_int32, fn_transparent_converted);
+  EXPECT_NE(fn_int32, fn_derived);
+  EXPECT_EQ(fn_uintptr, fn_int_ptr);
+  EXPECT_EQ(fn_int_ptr, fn_uint32_ptr);
+  EXPECT_EQ(
+      fn_derived(&derived_hash, &a_ptr, seed),
+      (HashElement<DerivedHash, /*kIsAbsl=*/false, /*kSeedShift=*/0>(
+          derived_hash, seed)(a)));
+  EXPECT_EQ(
+      fn_int32(nullptr, &a_ptr, seed),
+      (HashElement<absl::Hash<int32_t>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<int32_t>{}, seed)(a)));
+  EXPECT_EQ(
+      fn_uint32(nullptr, &b_ptr, seed),
+      (HashElement<absl::Hash<uint32_t>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<uint32_t>{}, seed)(b)));
+  EXPECT_EQ(
+      fn_enum(nullptr, &c_ptr, seed),
+      (HashElement<absl::Hash<MyEnum>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<MyEnum>{}, seed)(c)));
+  EXPECT_EQ(
+      fn_int_ptr(nullptr, &a_ptr_ptr, seed),
+      (HashElement<absl::Hash<int32_t*>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<int32_t*>{}, seed)(a_ptr)));
+  EXPECT_EQ(
+      fn_uint32_ptr(nullptr, &b_ptr_ptr, seed),
+      (HashElement<absl::Hash<uint32_t*>, /*kIsAbsl=*/true, /*kSeedShift=*/0>(
+          absl::Hash<uint32_t*>{}, seed)(b_ptr)));
 }
 
 TEST(HashElement, DefaultHash) {

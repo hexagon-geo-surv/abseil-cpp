@@ -1601,8 +1601,42 @@ struct PoisonedHash : private AggregateBarrier {
   size_t hash_with_seed() const = delete;
 };
 
+// Canonical byte-array representation for types of size `N` whose hash depends
+// only on their raw bytes.
+template <size_t N>
+struct SameSizeUniquelyRepresented {
+  unsigned char bytes[N];
+};
+
+template <size_t N>
+struct is_uniquely_represented<SameSizeUniquelyRepresented<N>>
+    : std::true_type {};
+
+// Maps `T` to a canonical type when multiple types share the exact same hash
+// implementation. `is_uniquely_represented<T>` types and raw pointers `T*`
+// (which are hashed as `uintptr_t`) both hash their raw bytes, so they map to
+// `SameSizeUniquelyRepresented<sizeof(T)>`.
+// A partial specialization is used instead of `std::conditional_t` to avoid
+// evaluating `sizeof(T)` when `Hash<T>` is instantiated with an incomplete
+// type (such as a recursive struct containing a hash table of itself).
+template <typename T,
+          bool = is_uniquely_represented<T>::value || std::is_pointer_v<T>>
+struct CanonicalHashTypeImpl {
+  using type = T;
+};
+
 template <typename T>
-struct HashImpl {
+struct CanonicalHashTypeImpl<T, true> {
+  using type = SameSizeUniquelyRepresented<sizeof(T)>;
+};
+
+template <typename T>
+using CanonicalHashType = typename CanonicalHashTypeImpl<T>::type;
+
+template <typename T>
+struct CanonicalHashImpl {
+  using KeyType = T;
+
   size_t operator()(const T& value) const {
     return MixingHashState::hash(value);
   }
@@ -1614,6 +1648,34 @@ struct HashImpl {
     return MixingHashState::hash_with_seed(value, seed);
   }
 };
+
+// Base class for `absl::Hash<T>` when `T` is hashable. Inherits from the
+// canonical `CanonicalHashImpl<CanonicalHashType<T>>` so `CanonicalHasher()`
+// can slice `absl::Hash<T>` to its unique `CanonicalHashImpl` base class, while
+// defining `operator()` and `hash_with_seed` for `const T&` directly so
+// arguments are implicitly converted to `T` before hashing.
+template <typename T>
+struct HashImpl : CanonicalHashImpl<CanonicalHashType<T>> {
+  size_t operator()(const T& value) const {
+    return MixingHashState::hash(value);
+  }
+
+ protected:
+  friend HashWithSeed;
+
+  size_t hash_with_seed(const T& value, size_t seed) const {
+    return MixingHashState::hash_with_seed(value, seed);
+  }
+};
+
+// Returns a canonical hasher by slicing `hasher` to its `CanonicalHashImpl`
+// base class. This is useful for type erasure of types with the exact same
+// hash function.
+template <typename T>
+constexpr CanonicalHashImpl<T> CanonicalHasher(
+    const CanonicalHashImpl<T>& hasher) {
+  return hasher;
+}
 
 template <typename T>
 struct Hash
@@ -1660,7 +1722,7 @@ using TransparentHashBase =
                        TransparentHashImpl<Ts...>, PoisonedHash>;
 
 template <typename... Ts>
-class TransparentHash : private TransparentHashBase<Ts...> {
+class TransparentHash final : private TransparentHashBase<Ts...> {
  public:
   using is_transparent = void;
   using TransparentHashBase<Ts...>::operator();

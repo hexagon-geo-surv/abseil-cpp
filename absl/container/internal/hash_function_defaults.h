@@ -45,12 +45,12 @@
 #ifndef ABSL_CONTAINER_INTERNAL_HASH_FUNCTION_DEFAULTS_H_
 #define ABSL_CONTAINER_INTERNAL_HASH_FUNCTION_DEFAULTS_H_
 
-#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 #include "absl/base/config.h"
 #include "absl/container/internal/common.h"
@@ -70,27 +70,18 @@ struct HashEq {
   using Eq = std::equal_to<T>;
 };
 
-struct StringHash {
+struct StringHash final : private absl::Hash<absl::string_view>,
+                          private absl::Hash<std::string>,
+                          private absl::Hash<absl::Cord> {
   using is_transparent = void;
-
-  size_t operator()(absl::string_view v) const {
-    return absl::Hash<absl::string_view>{}(v);
-  }
-  size_t operator()(const absl::Cord& v) const {
-    return absl::Hash<absl::Cord>{}(v);
-  }
+  using absl::Hash<absl::string_view>::operator();
+  using absl::Hash<absl::Cord>::operator();
 
  private:
   friend struct absl::hash_internal::HashWithSeed;
 
-  size_t hash_with_seed(absl::string_view v, size_t seed) const {
-    return absl::hash_internal::HashWithSeed().hash(
-        absl::Hash<absl::string_view>{}, v, seed);
-  }
-  size_t hash_with_seed(const absl::Cord& v, size_t seed) const {
-    return absl::hash_internal::HashWithSeed().hash(absl::Hash<absl::Cord>{}, v,
-                                                    seed);
-  }
+  using absl::Hash<absl::string_view>::hash_with_seed;
+  using absl::Hash<absl::Cord>::hash_with_seed;
 };
 
 struct StringEq {
@@ -123,20 +114,16 @@ template <>
 struct HashEq<absl::Cord> : StringHashEq {};
 
 template <typename TChar>
-struct BasicStringHash {
+struct BasicStringHash final
+    : private absl::Hash<std::basic_string_view<TChar>>,
+      private absl::Hash<std::basic_string<TChar>> {
   using is_transparent = void;
-
-  size_t operator()(std::basic_string_view<TChar> v) const {
-    return absl::Hash<std::basic_string_view<TChar>>{}(v);
-  }
+  using absl::Hash<std::basic_string_view<TChar>>::operator();
 
  private:
   friend struct absl::hash_internal::HashWithSeed;
 
-  size_t hash_with_seed(std::basic_string_view<TChar> v, size_t seed) const {
-    return absl::hash_internal::HashWithSeed().hash(
-        absl::Hash<std::basic_string_view<TChar>>{}, v, seed);
-  }
+  using absl::Hash<std::basic_string_view<TChar>>::hash_with_seed;
 };
 
 template <typename TChar>
@@ -177,40 +164,40 @@ struct HashEq<std::u32string_view> : BasicStringHashEq<char32_t> {};
 // Supports heterogeneous lookup for pointers and smart pointers.
 template <class T>
 struct HashEq<T*> {
-  struct Hash {
-    using is_transparent = void;
-    template <class U>
-    size_t operator()(const U& ptr) const {
-      return absl::Hash<const T*>{}(HashEq::ToPtr(ptr));
+ private:
+  struct Ptr {
+    Ptr(const T* p) : ptr(p) {}  // NOLINT
+    template <class U, class D,
+              std::enable_if_t<std::is_convertible_v<U*, const T*>, int> = 0>
+    Ptr(const std::unique_ptr<U, D>& p) : ptr(p.get()) {}  // NOLINT
+    template <class U,
+              std::enable_if_t<std::is_convertible_v<U*, const T*>, int> = 0>
+    Ptr(const std::shared_ptr<U>& p) : ptr(p.get()) {}  // NOLINT
+
+    template <typename H>
+    friend H AbslHashValue(H h, Ptr p) {
+      return H::combine(std::move(h), p.ptr);
     }
+
+    const T* ptr;
+  };
+
+ public:
+  struct Hash final : private absl::Hash<T*>, private absl::Hash<Ptr> {
+    using is_transparent = void;
+    using absl::Hash<T*>::operator();
+    using absl::Hash<Ptr>::operator();
 
    private:
     friend struct absl::hash_internal::HashWithSeed;
 
-    template <class U>
-    size_t hash_with_seed(const U& ptr, size_t seed) const {
-      return absl::hash_internal::HashWithSeed().hash(absl::Hash<const T*>{},
-                                                      HashEq::ToPtr(ptr), seed);
-    }
+    using absl::Hash<T*>::hash_with_seed;
+    using absl::Hash<Ptr>::hash_with_seed;
   };
   struct Eq {
     using is_transparent = void;
-    template <class A, class B>
-    bool operator()(const A& a, const B& b) const {
-      return HashEq::ToPtr(a) == HashEq::ToPtr(b);
-    }
+    bool operator()(Ptr a, Ptr b) const { return a.ptr == b.ptr; }
   };
-
- private:
-  static const T* ToPtr(const T* ptr) { return ptr; }
-  template <class U, class D>
-  static const T* ToPtr(const std::unique_ptr<U, D>& ptr) {
-    return ptr.get();
-  }
-  template <class U>
-  static const T* ToPtr(const std::shared_ptr<U>& ptr) {
-    return ptr.get();
-  }
 };
 
 template <class T, class D>

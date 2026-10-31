@@ -408,6 +408,26 @@ TEST(FlatHashSet, IsDefaultHash) {
   };
   EXPECT_EQ((HashtableDebugAccess<flat_hash_set<size_t, Hash>>::kIsAbslHash),
             false);
+
+  struct DerivedHash : absl::Hash<int> {
+    size_t operator()(int i) const { return absl::Hash<int>::operator()(-i); }
+  };
+  EXPECT_EQ(
+      (HashtableDebugAccess<flat_hash_set<int, DerivedHash>>::kIsAbslHash),
+      false);
+}
+
+TEST(FlatHashSet, DerivedFromAbslHashCallsDerivedOperator) {
+  struct DerivedHash : absl::Hash<int> {
+    size_t operator()(int i) const { return absl::Hash<int>::operator()(-i); }
+  };
+  flat_hash_set<int, DerivedHash> s;
+  for (int i = 0; i < 100; ++i) {
+    s.insert(i);
+  }
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_TRUE(s.contains(i));
+  }
 }
 
 #if defined(__cpp_lib_containers_ranges) && \

@@ -1121,6 +1121,39 @@ TEST(IsUniquelyRepresentedTest, SanityTest) {
   EXPECT_FALSE(is_uniquely_represented<int*>::value);
 }
 
+TEST(CanonicalHasherTest, UniquelyRepresentedAndPointerTypesShareBaseClass) {
+  using absl::hash_internal::CanonicalHasher;
+  enum class Enum32 : uint32_t { kA = 1 };
+  enum class SignedEnum32 : int32_t { kA = -1 };
+
+  using CanonicalInt32 = decltype(CanonicalHasher(absl::Hash<int32_t>()));
+  using CanonicalUint32 = decltype(CanonicalHasher(absl::Hash<uint32_t>()));
+  using CanonicalEnum32 = decltype(CanonicalHasher(absl::Hash<Enum32>()));
+  using CanonicalSignedEnum32 =
+      decltype(CanonicalHasher(absl::Hash<SignedEnum32>()));
+  using CanonicalUintptr = decltype(CanonicalHasher(absl::Hash<uintptr_t>()));
+  using CanonicalIntPtr = decltype(CanonicalHasher(absl::Hash<int*>()));
+  using CanonicalDoublePtr = decltype(CanonicalHasher(absl::Hash<double*>()));
+  using CanonicalConstIntPtr =
+      decltype(CanonicalHasher(absl::Hash<const int*>()));
+  using CanonicalString = decltype(CanonicalHasher(absl::Hash<std::string>()));
+
+  EXPECT_TRUE((std::is_same_v<CanonicalInt32, CanonicalUint32>));
+  EXPECT_TRUE((std::is_same_v<CanonicalInt32, CanonicalEnum32>));
+  EXPECT_TRUE((std::is_same_v<CanonicalInt32, CanonicalSignedEnum32>));
+  EXPECT_TRUE((std::is_same_v<CanonicalUintptr, CanonicalIntPtr>));
+  EXPECT_TRUE((std::is_same_v<CanonicalIntPtr, CanonicalDoublePtr>));
+  EXPECT_TRUE((std::is_same_v<CanonicalIntPtr, CanonicalConstIntPtr>));
+  EXPECT_FALSE((std::is_same_v<CanonicalInt32, CanonicalString>));
+
+  EXPECT_TRUE((std::is_base_of_v<CanonicalInt32, absl::Hash<int32_t>>));
+  EXPECT_TRUE((std::is_base_of_v<CanonicalInt32, absl::Hash<uint32_t>>));
+  EXPECT_TRUE((std::is_base_of_v<CanonicalInt32, absl::Hash<Enum32>>));
+  EXPECT_TRUE((std::is_base_of_v<CanonicalIntPtr, absl::Hash<int*>>));
+  EXPECT_TRUE((std::is_base_of_v<CanonicalIntPtr, absl::Hash<double*>>));
+  EXPECT_TRUE((std::is_base_of_v<CanonicalString, absl::Hash<std::string>>));
+}
+
 struct IntAndString {
   int i;
   std::string s;
