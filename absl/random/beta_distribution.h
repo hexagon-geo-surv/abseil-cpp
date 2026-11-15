@@ -15,6 +15,7 @@
 #ifndef ABSL_RANDOM_BETA_DISTRIBUTION_H_
 #define ABSL_RANDOM_BETA_DISTRIBUTION_H_
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -25,12 +26,24 @@
 
 #include "absl/base/config.h"
 #include "absl/meta/type_traits.h"
+#include "absl/random/bernoulli_distribution.h"
 #include "absl/random/internal/fast_uniform_bits.h"
 #include "absl/random/internal/generate_real.h"
 #include "absl/random/internal/iostream_state_saver.h"
 
 namespace absl {
 ABSL_NAMESPACE_BEGIN
+namespace random_internal {
+
+// Computes (expm1(x) - x) / x for |x| <= 0.25 without cancellation.
+double BetaExpm1MinusXOverX(double x);
+long double BetaExpm1MinusXOverX(long double x);
+
+// Computes (log1p(u) - u) / u for |u| <= 0.25 without cancellation.
+double BetaLog1pMinusXOverX(double u);
+long double BetaLog1pMinusXOverX(long double u);
+
+}  // namespace random_internal
 
 // absl::beta_distribution:
 // Generate a floating-point variate conforming to a Beta distribution:
@@ -63,59 +76,78 @@ class beta_distribution {
       assert(beta <= (std::numeric_limits<result_type>::max)());
       if (alpha == 0 || beta == 0) {
         method_ = DEGENERATE_SMALL;
-        x_ = (alpha >= beta) ? 1 : 0;
+        if (alpha == beta) {
+          inverted_ = false;
+          x_ = calc_type(0.5);
+        } else {
+          inverted_ = (beta < alpha);
+          x_ = calc_type(0);
+        }
         return;
       }
       // a_ = min(beta, alpha), b_ = max(beta, alpha).
       if (beta < alpha) {
         inverted_ = true;
-        a_ = beta;
-        b_ = alpha;
+        a_ = static_cast<calc_type>(beta);
+        b_ = static_cast<calc_type>(alpha);
       } else {
         inverted_ = false;
-        a_ = alpha;
-        b_ = beta;
-      }
-      if (a_ <= 1 && b_ >= ThresholdForLargeA()) {
-        method_ = DEGENERATE_SMALL;
-        x_ = inverted_ ? result_type(1) : result_type(0);
-        return;
+        a_ = static_cast<calc_type>(alpha);
+        b_ = static_cast<calc_type>(beta);
       }
       // For threshold values, see also:
       // Evaluation of Beta Generation Algorithms, Ying-Chao Hung, et. al.
       // February, 2009.
-      if ((b_ < 1.0 && a_ + b_ <= 1.2) || a_ <= ThresholdForSmallA()) {
+      if ((b_ < calc_type(1) && a_ + b_ <= calc_type(1.2)) ||
+          a_ <= static_cast<calc_type>(ThresholdForSmallA())) {
         // Choose Joehnk over Cheng when it's faster or when Cheng encounters
         // numerical issues.
-        method_ = JOEHNK;
-        a_ = result_type(1) / alpha_;
-        b_ = result_type(1) / beta_;
-        if (std::isinf(a_) || std::isinf(b_)) {
+        int exp_b = 0;
+        std::frexp(b_, &exp_b);
+        const calc_type inv_alpha =
+            calc_type(1) / static_cast<calc_type>(alpha_);
+        const calc_type inv_beta = calc_type(1) / static_cast<calc_type>(beta_);
+        if (exp_b <= std::numeric_limits<calc_type>::min_exponent / 2 ||
+            std::isinf(inv_alpha) || std::isinf(inv_beta)) {
+          // Both parameters are so small that log(u)/alpha and log(v)/beta
+          // could both overflow to -inf (or 1/alpha or 1/beta overflows).
+          // In this limit Beta(alpha, beta) collapses to
+          // Bernoulli(alpha / (alpha + beta)); rescale by 2^-exp_b to avoid
+          // overflow and subnormal underflow.
           method_ = DEGENERATE_SMALL;
-          x_ = inverted_ ? result_type(1) : result_type(0);
+          const calc_type a_s = std::scalbn(a_, -exp_b);
+          const calc_type b_s = std::scalbn(b_, -exp_b);
+          x_ = a_s / (a_s + b_s);
+          return;
         }
+        method_ = JOEHNK;
+        a_ = inv_alpha;
+        b_ = inv_beta;
         return;
       }
-      if (a_ >= ThresholdForLargeA()) {
+      // If both parameters are at or above ThresholdForLargeA() (since
+      // a_ <= b_, checking a_ suffices), the relative standard deviation is
+      // <= 1 / sqrt(ThresholdForLargeA()) << ULP, so the variate collapses to
+      // the mean a / (a + b). Rescale by b_ so a_ + b_ never overflows.
+      if (a_ >= static_cast<calc_type>(ThresholdForLargeA())) {
         method_ = DEGENERATE_LARGE;
         // Note: on PPC for long double, evaluating
         // `std::numeric_limits::max() / ThresholdForLargeA` results in NaN.
-        result_type r = a_ / b_;
-        x_ = (inverted_ ? result_type(1) : r) / (1 + r);
+        const calc_type r = a_ / b_;
+        x_ = (inverted_ ? calc_type(1) : r) / (calc_type(1) + r);
         return;
       }
-      x_ = a_ + b_;
-      log_x_ = std::log(x_);
-      if (a_ <= 1) {
+      if (a_ <= calc_type(1)) {
         method_ = CHENG_BA;
-        y_ = result_type(1) / a_;
-        gamma_ = a_ + a_;
+        y_ = calc_type(1) / a_;
         return;
       }
       method_ = CHENG_BB;
-      result_type r = (a_ - 1) / (b_ - 1);
-      y_ = std::sqrt((1 + r) / (b_ * r * 2 - r + 1));
-      gamma_ = a_ + result_type(1) / y_;
+      // Compute y = sqrt((a + b - 2) / (2ab - a - b)) without overflowing
+      // a * b or underflowing (a - 1) / (b - 1).
+      const calc_type fa = (a_ - calc_type(1)) / a_;
+      const calc_type fb = (b_ - calc_type(1)) / b_;
+      y_ = std::sqrt((fa / b_ + fb / a_) / (fa + fb));
     }
 
     result_type alpha() const { return alpha_; }
@@ -131,6 +163,9 @@ class beta_distribution {
 
    private:
     friend class beta_distribution;
+
+    using calc_type =
+        std::conditional_t<std::is_same_v<RealType, float>, double, RealType>;
 
 #ifdef _MSC_VER
     // MSVC does not have constexpr implementations for std::log and std::exp
@@ -182,12 +217,10 @@ class beta_distribution {
     result_type alpha_;
     result_type beta_;
 
-    result_type a_{};  // the smaller of {alpha, beta}, or 1.0/alpha_ in JOEHNK
-    result_type b_{};  // the larger of {alpha, beta}, or 1.0/beta_ in JOEHNK
-    result_type x_{};  // alpha + beta, or the result in degenerate cases
-    result_type log_x_{};  // log(x_)
-    result_type y_{};      // "beta" in Cheng
-    result_type gamma_{};  // "gamma" in Cheng
+    calc_type a_{};  // min(alpha, beta) in Cheng, or 1/alpha_ in JOEHNK
+    calc_type b_{};  // max(alpha, beta) in Cheng, or 1/beta_ in JOEHNK
+    calc_type x_{};  // Bernoulli p in DEGENERATE_SMALL, or mean in LARGE
+    calc_type y_{};  // "beta" in Cheng
 
     Method method_{};
 
@@ -238,6 +271,8 @@ class beta_distribution {
   }
 
  private:
+  using calc_type = typename param_type::calc_type;
+
   template <typename URBG>
   result_type AlgorithmJoehnk(URBG& g,  // NOLINT(runtime/references)
                               const param_type& p);
@@ -249,13 +284,15 @@ class beta_distribution {
   template <typename URBG>
   result_type DegenerateCase(URBG& g,  // NOLINT(runtime/references)
                              const param_type& p) {
-    if (p.method_ == param_type::DEGENERATE_SMALL && p.alpha_ == p.beta_) {
-      // Returns 0 or 1 with equal probability.
-      random_internal::FastUniformBits<uint8_t> fast_u8;
-      return static_cast<result_type>((fast_u8(g) & 0x10) !=
-                                      0);  // pick any single bit.
+    if (p.method_ == param_type::DEGENERATE_SMALL) {
+      if (p.x_ == calc_type(0)) {
+        return p.inverted_ ? result_type(1) : result_type(0);
+      }
+      const bool hit =
+          absl::bernoulli_distribution(static_cast<double>(p.x_))(g);
+      return (hit != p.inverted_) ? result_type(1) : result_type(0);
     }
-    return p.x_;
+    return static_cast<result_type>(p.x_);
   }
 
   param_type param_;
@@ -280,53 +317,64 @@ beta_distribution<RealType>::AlgorithmJoehnk(
     const param_type& p) {
   using random_internal::GeneratePositiveTag;
   using random_internal::GenerateRealFromBits;
-  using real_type =
-      std::conditional_t<std::is_same_v<RealType, float>, float, double>;
 
   // Based on Joehnk, M. D. Erzeugung von betaverteilten und gammaverteilten
   // Zufallszahlen. Metrika 8.1 (1964): 5-15.
   // This method is described in Knuth, Vol 2 (Third Edition), pp 134.
+  static constexpr calc_type kLn2 =
+      calc_type(0.693147180559945309417232121458176568L);  // log(2)
+  // Direct method. std::pow is slow for float; when 1/alpha < 1 or 1/beta < 1,
+  // pow(u, p.a_) can round to 1.0 and mask z > 1; and when 1/alpha or 1/beta
+  // is large, pow frequently underflows below min_normal and wastes work before
+  // falling through to log space.
+  static constexpr calc_type kMaxDirectPowExponent = calc_type(500);
+  const bool try_direct_pow = !std::is_same_v<float, result_type> &&
+                              p.a_ >= calc_type(1) && p.b_ >= calc_type(1) &&
+                              p.a_ <= kMaxDirectPowExponent &&
+                              p.b_ <= kMaxDirectPowExponent;
 
-  result_type u, v, x, y, z;
   for (;;) {
-    u = GenerateRealFromBits<real_type, GeneratePositiveTag, false>(
-        fast_u64_(g));
-    v = GenerateRealFromBits<real_type, GeneratePositiveTag, false>(
-        fast_u64_(g));
+    const calc_type u = static_cast<calc_type>(
+        GenerateRealFromBits<double, GeneratePositiveTag, false>(fast_u64_(g)));
+    const calc_type v = static_cast<calc_type>(
+        GenerateRealFromBits<double, GeneratePositiveTag, false>(fast_u64_(g)));
 
-    // Direct method. std::pow is slow for float, so rely on the optimizer to
-    // remove the std::pow() path for that case.
-    if (!std::is_same_v<float, result_type>) {
-      x = std::pow(u, p.a_);
-      y = std::pow(v, p.b_);
-      z = x + y;
-      if (z > 1) {
-        // Reject if and only if `x + y > 1.0`
+    if (try_direct_pow) {
+      const calc_type x = std::pow(u, p.a_);
+      const calc_type y = std::pow(v, p.b_);
+      const calc_type z = x + y;
+      if (z > calc_type(1)) {
+        // Reject if and only if `x + y > 1.0`.
         continue;
       }
-      if (z > 0) {
-        // When both alpha and beta are small, x and y are both close to 0, so
-        // divide by (x+y) directly may result in nan.
-        return x / z;
+      if (z < calc_type(1) &&
+          (std::min)(x, y) >= (std::numeric_limits<calc_type>::min)()) {
+        // Only return x / z when both x and y are normal; otherwise fall
+        // through to the log-transform path to avoid subnormal flush.
+        return static_cast<result_type>(x / z);
       }
     }
 
     // Log transform.
-    // x = log( pow(u, p.a_) ), y = log( pow(v, p.b_) )
-    // since u, v <= 1.0,  x, y < 0.
-    x = std::log(u) * p.a_;
-    y = std::log(v) * p.b_;
-    if (!std::isfinite(x) || !std::isfinite(y)) {
+    // x = log(pow(u, 1 / alpha)), y = log(pow(v, 1 / beta)).
+    // Since u, v in (0, 1), x and y are negative (possibly -inf for the
+    // smaller parameter, but never both -inf because param_type routes
+    // max(alpha, beta) <= sqrt(min_normal) to DEGENERATE_SMALL).
+    const calc_type x = std::log(u) / static_cast<calc_type>(p.alpha_);
+    const calc_type y = std::log(v) / static_cast<calc_type>(p.beta_);
+    const calc_type m = (std::max)(x, y);
+    // Reject iff log(e^x + e^y) > 0. Since log(e^x + e^y) <= m + log(2),
+    // m <= -log(2) guarantees acceptance without computing exp/log1p.
+    if (m > -kLn2 &&
+        m + std::log1p(std::exp(-std::abs(x - y))) > calc_type(0)) {
       continue;
     }
-    // z = log( pow(u, a) + pow(v, b) )
-    z = x > y ? (x + std::log(1 + std::exp(y - x)))
-              : (y + std::log(1 + std::exp(x - y)));
-    // Reject iff log(x+y) > 0.
-    if (z > 0) {
-      continue;
+    if (x >= y) {
+      return static_cast<result_type>(calc_type(1) /
+                                      (calc_type(1) + std::exp(y - x)));
     }
-    return std::exp(x - z);
+    const calc_type e = std::exp(x - y);
+    return static_cast<result_type>(e / (calc_type(1) + e));
   }
 }
 
@@ -338,43 +386,122 @@ beta_distribution<RealType>::AlgorithmCheng(
     const param_type& p) {
   using random_internal::GeneratePositiveTag;
   using random_internal::GenerateRealFromBits;
-  using real_type =
-      std::conditional_t<std::is_same_v<RealType, float>, float, double>;
 
   // Based on Cheng, Russell CH. Generating beta variates with nonintegral
   // shape parameters. Communications of the ACM 21.4 (1978): 317-322.
   // (https://dl.acm.org/citation.cfm?id=359482).
-  static constexpr result_type kLogFour =
-      result_type(1.3862943611198906188344642429163531361);  // log(4)
-  static constexpr result_type kS =
-      result_type(2.6094379124341003746007593332261876);  // 1+log(5)
+  static constexpr calc_type kLogFour =
+      calc_type(1.3862943611198906188344642429163531361L);  // log(4)
+  static constexpr calc_type kS =
+      calc_type(2.6094379124341003746007593332261876L);  // 1 + log(5)
+  static constexpr calc_type kMinNormal =
+      (std::numeric_limits<calc_type>::min)();
+  static constexpr calc_type kMaxQuarter =
+      (std::numeric_limits<calc_type>::max)() / calc_type(4);
 
   const bool use_algorithm_ba = (p.method_ == param_type::CHENG_BA);
-  result_type u1, u2, v, w, z, r, s, t, bw_inv, lhs;
+  const calc_type a = p.a_;
+  const calc_type b = p.b_;
+  const calc_type r = a / b;
+  const calc_type inv_1pr = calc_type(1) / (calc_type(1) + r);
+  const calc_type a_frac = r * inv_1pr;
+  const calc_type b_frac = calc_type(1) - a_frac;
+  const bool subnormal_a_frac = (a_frac < kMinNormal);
+
+  calc_type v, expm1_v, u;
   for (;;) {
-    u1 = GenerateRealFromBits<real_type, GeneratePositiveTag, false>(
-        fast_u64_(g));
-    u2 = GenerateRealFromBits<real_type, GeneratePositiveTag, false>(
-        fast_u64_(g));
-    v = p.y_ * std::log(u1 / (1 - u1));
-    w = p.a_ * std::exp(v);
-    bw_inv = result_type(1) / (p.b_ + w);
-    r = p.gamma_ * v - kLogFour;
-    s = p.a_ + r - w;
-    z = u1 * u1 * u2;
-    if (!use_algorithm_ba && s + kS >= 5 * z) {
+    const double u1 =
+        GenerateRealFromBits<double, GeneratePositiveTag, false>(fast_u64_(g));
+    const double u2 =
+        GenerateRealFromBits<double, GeneratePositiveTag, false>(fast_u64_(g));
+    const calc_type logit = static_cast<calc_type>(std::log(u1 / (1.0 - u1)));
+    v = p.y_ * logit;
+    expm1_v = std::expm1(v);
+    if (!std::isfinite(expm1_v)) {
+      continue;
+    }
+    if (subnormal_a_frac) {
+      // a < 4 and b > max / 4; avoid subnormal rounding in a_frac.
+      if (std::abs(expm1_v) > kMaxQuarter) {
+        u = (a * (expm1_v / b)) * inv_1pr;
+      } else {
+        u = ((a * expm1_v) / b) * inv_1pr;
+      }
+    } else {
+      u = a_frac * expm1_v;
+    }
+    if (!std::isfinite(u)) {
+      continue;
+    }
+
+    // Compute a * (expm1(v) - v) without cancellation or v^2 underflow.
+    const calc_type a_expm1_minus_v =
+        (std::abs(v) <= calc_type(0.25))
+            ? (a * v) * random_internal::BetaExpm1MinusXOverX(v)
+            : a * (expm1_v - v);
+
+    // Cheng's squeeze: s = a + (gamma * v - log(4)) - a * exp(v)
+    //                    = logit - a * (expm1(v) - v) - log(4),
+    // since gamma = a + 1 / y and v / y = logit.
+    const calc_type s = logit - a_expm1_minus_v - kLogFour;
+    // u1, u2 >= 2^-65, so z >= 2^-195 >> DBL_MIN cannot underflow in double.
+    const double z = u1 * u1 * u2;
+    if (!use_algorithm_ba &&
+        s + kS >= calc_type(5) * static_cast<calc_type>(z)) {
       break;
     }
-    t = std::log(z);
+    const calc_type t = static_cast<calc_type>(std::log(z));
     if (!use_algorithm_ba && s >= t) {
       break;
     }
-    lhs = p.x_ * (p.log_x_ + std::log(bw_inv)) + r;
+
+    // Cheng's exact acceptance:
+    //   lhs = -(a + b) * log(1 + u) + a * v + logit - log(4),
+    // where u = (a / (a + b)) * expm1(v). For |u| <= 0.25, rewrite using
+    // (a + b) * u == a * expm1(v) to eliminate O(a * v) cancellation:
+    //   -(a + b) * log(1 + u) + a * v
+    //     = -(a * expm1(v)) * ((log1p(u) - u) / u) - a * (expm1(v) - v).
+    // Note |u| <= 0.25 implies |a * expm1(v)| <= 0.25 * (a + b) <= 0.5 * b.
+    calc_type lhs;
+    if (std::abs(u) <= calc_type(0.25)) {
+      lhs = -(a * expm1_v) * random_internal::BetaLog1pMinusXOverX(u) -
+            a_expm1_minus_v + logit - kLogFour;
+    } else {
+      const calc_type log1p_u = std::log1p(u);
+      if (log1p_u > kMaxQuarter / b) {
+        continue;
+      }
+      lhs = -(b * log1p_u) * (calc_type(1) + r) + a * v + logit - kLogFour;
+    }
     if (lhs >= t) {
       break;
     }
   }
-  return p.inverted_ ? (1 - w * bw_inv) : w * bw_inv;
+
+  calc_type res;
+  if (std::abs(v) <= calc_type(0.5)) {
+    if (subnormal_a_frac) {
+      res =
+          p.inverted_ ? (b_frac / (calc_type(1) + u)) : ((a * std::exp(v)) / b);
+    } else {
+      const calc_type delta = (b_frac * u) / (calc_type(1) + u);
+      res = p.inverted_ ? (b_frac - delta) : (a_frac + delta);
+    }
+  } else if (p.inverted_) {
+    res = b_frac / (calc_type(1) + u);
+  } else if (u > calc_type(1)) {
+    res = calc_type(1) - b_frac / (calc_type(1) + u);
+  } else if (subnormal_a_frac) {
+    const calc_type exp_v = std::exp(v);
+    if (exp_v > kMaxQuarter) {
+      res = (a * (exp_v / b)) * inv_1pr / (calc_type(1) + u);
+    } else {
+      res = ((a * exp_v) / b) * inv_1pr / (calc_type(1) + u);
+    }
+  } else {
+    res = (a_frac * std::exp(v)) / (calc_type(1) + u);
+  }
+  return (std::min)(static_cast<result_type>(res), result_type(1));
 }
 
 template <typename RealType>

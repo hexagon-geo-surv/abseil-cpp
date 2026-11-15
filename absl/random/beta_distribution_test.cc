@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <iterator>
 #include <limits>
+#include <ostream>
 #include <random>
 #include <sstream>
 #include <string>
@@ -84,14 +85,23 @@ TYPED_TEST(BetaDistributionInterfaceTest, SerializeTest) {
   constexpr int kCount = 1000;
   absl::InsecureBitGen gen;
   const TypeParam kValues[] = {
-      TypeParam(1e-20), TypeParam(1e-12), TypeParam(1e-8), TypeParam(1e-4),
-      TypeParam(1e-3), TypeParam(0.1), TypeParam(0.25),
+      TypeParam(1e-20),
+      TypeParam(1e-12),
+      TypeParam(1e-8),
+      TypeParam(1e-4),
+      TypeParam(1e-3),
+      TypeParam(0.1),
+      TypeParam(0.25),
       std::nextafter(TypeParam(0.5), TypeParam(0)),  // 0.5 - epsilon
       std::nextafter(TypeParam(0.5), TypeParam(1)),  // 0.5 + epsilon
-      TypeParam(0.5), TypeParam(1.0),                //
-      std::nextafter(TypeParam(1), TypeParam(0)),    // 1 - epsilon
-      std::nextafter(TypeParam(1), TypeParam(2)),    // 1 + epsilon
-      TypeParam(12.5), TypeParam(1e2), TypeParam(1e8), TypeParam(1e12),
+      TypeParam(0.5),
+      TypeParam(1.0),                              //
+      std::nextafter(TypeParam(1), TypeParam(0)),  // 1 - epsilon
+      std::nextafter(TypeParam(1), TypeParam(2)),  // 1 + epsilon
+      TypeParam(12.5),
+      TypeParam(1e2),
+      TypeParam(1e8),
+      TypeParam(1e12),
       TypeParam(1e20),                        //
       kSmallA,                                //
       std::nextafter(kSmallA, TypeParam(0)),  //
@@ -509,7 +519,7 @@ TEST(BetaDistributionTest, StabilityTest) {
                     998340000, 619030004, 500000001, 999990000, 996280000,
                     500000001, 844740004, 847210001, 999970000, 872320000,
                     585480007, 933280000, 869080042, 647670031, 528240004,
-                    969980004, 626050008, 915930002, 833440033, 878040015));
+                    969980004, 626050008, 915930002, 833450033, 878040015));
   }
 
   urbg.reset();
@@ -583,7 +593,7 @@ TEST(BetaDistributionTest, AlgorithmBounds) {
     // u=0.499, v=0.5
     absl::beta_distribution<double> dist(1e-4, 1e-4);
     double a = dist(urbg);
-    EXPECT_EQ(a, 2.0202860861567108529e-09);
+    EXPECT_EQ(a, 2.0202860861579454e-09);
     EXPECT_EQ(2, urbg.invocations());
   }
 
@@ -615,6 +625,253 @@ TEST(BetaDistributionTest, AlgorithmBounds) {
       EXPECT_NEAR(0.98106688261032104, x, 0.0000005) << x << "f";
     }
   }
+}
+
+struct SampleMoments {
+  double mean;
+  double stddev;
+  int zeros;
+  int ones;
+  int total;
+};
+
+void PrintTo(const SampleMoments& m, std::ostream* os) {
+  *os << "{mean=" << absl::StreamFormat("%.17g", m.mean)
+      << ", stddev=" << absl::StreamFormat("%.17g", m.stddev)
+      << ", zeros=" << m.zeros << ", ones=" << m.ones << ", total=" << m.total
+      << "}";
+}
+
+template <typename RealType>
+SampleMoments SampleScaledMoments(RealType alpha, RealType beta, double scale,
+                                  int samples) {
+  absl::random_internal::pcg64_2018_engine rng(0x2B7E151628AED2A6ULL);
+  absl::beta_distribution<RealType> dist(alpha, beta);
+  std::vector<double> values;
+  values.reserve(static_cast<size_t>(samples));
+  int zeros = 0;
+  int ones = 0;
+  double sum = 0.0;
+  for (int i = 0; i < samples; ++i) {
+    const RealType sample = dist(rng);
+    EXPECT_TRUE(std::isfinite(sample));
+    EXPECT_GE(sample, RealType(0));
+    EXPECT_LE(sample, RealType(1));
+    if (sample == RealType(0)) ++zeros;
+    if (sample == RealType(1)) ++ones;
+    const double scaled = static_cast<double>(sample) * scale;
+    values.push_back(scaled);
+    sum += scaled;
+  }
+  const double mean = sum / samples;
+  double sq_diff_sum = 0.0;
+  for (double v : values) {
+    const double d = v - mean;
+    sq_diff_sum += d * d;
+  }
+  const double stddev = std::sqrt(sq_diff_sum / (samples - 1));
+  return SampleMoments{mean, stddev, zeros, ones, samples};
+}
+
+MATCHER_P4(HasMomentsNear, expected_mean, mean_tol, expected_stddev, stddev_tol,
+           absl::StrFormat("has mean within %.3g of %.6g and stddev within "
+                           "%.3g of %.6g",
+                           mean_tol, expected_mean, stddev_tol,
+                           expected_stddev)) {
+  const double mean_err = std::abs(arg.mean - expected_mean);
+  const double stddev_err = std::abs(arg.stddev - expected_stddev);
+  if (mean_err <= mean_tol && stddev_err <= stddev_tol) {
+    return true;
+  }
+  *result_listener << "mean error " << mean_err << " (tol " << mean_tol
+                   << "), stddev error " << stddev_err << " (tol " << stddev_tol
+                   << ")";
+  return false;
+}
+
+MATCHER_P2(IsBernoulliNear, expected_p, tol,
+           absl::StrFormat("contains only 0/1 samples with mean within %.3g "
+                           "of %.6g",
+                           tol, expected_p)) {
+  if (arg.zeros + arg.ones != arg.total) {
+    *result_listener << "has " << (arg.total - arg.zeros - arg.ones)
+                     << " non-binary samples";
+    return false;
+  }
+  const double err = std::abs(arg.mean - expected_p);
+  if (err <= tol) {
+    return true;
+  }
+  *result_listener << "mean error " << err << " (tol " << tol << ")";
+  return false;
+}
+
+TEST(BetaDistributionTest, HighSkewMeanAccuracy) {
+  constexpr int kSamples = 20000;
+
+  EXPECT_THAT(SampleScaledMoments<float>(0.5f, 1e8f, 1e8, kSamples),
+              HasMomentsNear(0.5, 0.05, std::sqrt(0.5), 0.06));
+  EXPECT_THAT(SampleScaledMoments<double>(0.5, 1e18, 1e18, kSamples),
+              HasMomentsNear(0.5, 0.05, std::sqrt(0.5), 0.06));
+  EXPECT_THAT(SampleScaledMoments<double>(2.0, 1e20, 1e20, kSamples),
+              HasMomentsNear(2.0, 0.1, std::sqrt(2.0), 0.08));
+
+  // True 1 - X mean is 5e-19 << double ULP at 1.0 (2.22e-16), so samples
+  // round to 1.0 rather than suffering 77x cancellation bias (~3.9e-17).
+  // Accumulate 1.0 - sample directly so summation does not lose tail precision.
+  absl::random_internal::pcg64_2018_engine rng(0x2B7E151628AED2A6ULL);
+  absl::beta_distribution<double> dist(1e18, 0.5);
+  double tail_sum = 0.0;
+  for (int i = 0; i < kSamples; ++i) {
+    tail_sum += 1.0 - dist(rng);
+  }
+  EXPECT_THAT(tail_sum / kSamples, ::testing::Lt(1e-18));
+}
+
+TEST(BetaDistributionTest, LargeBetaNearMaxDoesNotOverflowSum) {
+  absl::random_internal::pcg64_2018_engine rng(0x2B7E151628AED2A6ULL);
+  const double max_val = (std::numeric_limits<double>::max)();
+  const double alpha = 1e305;
+  const double r = alpha / max_val;
+  const double expected_ratio = r / (1.0 + r);
+
+  absl::beta_distribution<double> dist(alpha, max_val);
+  EXPECT_NEAR(dist(rng), expected_ratio, expected_ratio * 1e-12);
+
+  absl::beta_distribution<double> inv_dist(max_val, alpha);
+  EXPECT_NEAR(1.0 - inv_dist(rng), expected_ratio, expected_ratio * 1e-12);
+
+  // Both parameters above ThresholdForLargeA() hit DEGENERATE_LARGE without
+  // overflowing alpha + beta.
+  absl::beta_distribution<double> both_large(max_val * 0.5, max_val);
+  EXPECT_NEAR(both_large(rng), 1.0 / 3.0, 1e-12);
+
+  absl::beta_distribution<double> both_large_inv(max_val, max_val * 0.5);
+  EXPECT_NEAR(both_large_inv(rng), 2.0 / 3.0, 1e-12);
+}
+
+TEST(BetaDistributionTest, ChengLargeSymmetricPrecision) {
+  constexpr int kSamples = 20000;
+  // True stddev of Beta(a, a) is 1 / sqrt(4 * (2a + 1)). A 5% tolerance
+  // catches both the +28.3% Logistic inflation from s = (a + r) - w
+  // cancellation and discretization spikes from exp(v) around 1.0.
+  const double sigma_1e22 = 1.0 / std::sqrt(4.0 * 2e22);
+  EXPECT_THAT(
+      SampleScaledMoments<double>(1e22, 1e22, 1.0, kSamples),
+      HasMomentsNear(0.5, sigma_1e22 * 0.05, sigma_1e22, sigma_1e22 * 0.05));
+
+  const double sigma_1e30 = 1.0 / std::sqrt(4.0 * 2e30);
+  EXPECT_THAT(
+      SampleScaledMoments<double>(1e30, 1e30, 1.0, kSamples),
+      HasMomentsNear(0.5, sigma_1e30 * 0.05, sigma_1e30, sigma_1e30 * 0.05));
+
+  const double sigma_1e9 = 1.0 / std::sqrt(4.0 * 2e9);
+  EXPECT_THAT(
+      SampleScaledMoments<float>(1e9f, 1e9f, 1.0, kSamples),
+      HasMomentsNear(0.5, sigma_1e9 * 0.05, sigma_1e9, sigma_1e9 * 0.05));
+
+  // Verify float ChengBB computes t = log(u1*u1*u2) in double rather than
+  // float: for u1 = u2 = 2^-65, float(u1*u1*u2) flushes to 0.0f (t = -inf)
+  // and would falsely accept on the first draw (2 calls).
+  absl::random_internal::sequence_urbg urbg({
+      0ull,
+      0ull,
+      0x8000000000000000ull,
+      0x4000000000000000ull,
+  });
+  absl::beta_distribution<float> dist(5.0f, 5.0f);
+  const float sample = dist(urbg);
+  EXPECT_THAT(sample,
+              ::testing::AllOf(::testing::Ge(0.0f), ::testing::Le(1.0f)));
+  EXPECT_THAT(urbg.invocations(), ::testing::Gt(2u));
+}
+
+TEST(BetaDistributionTest, SkewedHugeBetaRetainsVariance) {
+  constexpr int kSamples = 20000;
+  // For b >= ThresholdForLargeA() and moderate a, b * Beta(a, b) ~ Gamma(a, 1)
+  // with mean a and stddev sqrt(a), rather than collapsing to a constant.
+  EXPECT_THAT(SampleScaledMoments<double>(2.0, 3e305, 3e305, kSamples),
+              HasMomentsNear(2.0, 0.06, std::sqrt(2.0), 0.06));
+  EXPECT_THAT(SampleScaledMoments<double>(1.0, 3e305, 3e305, kSamples),
+              HasMomentsNear(1.0, 0.05, 1.0, 0.05));
+  EXPECT_THAT(SampleScaledMoments<double>(0.5, 3e305, 3e305, kSamples),
+              HasMomentsNear(0.5, 0.04, std::sqrt(0.5), 0.05));
+  EXPECT_THAT(SampleScaledMoments<float>(2.0f, 1e37f, 1e37, kSamples),
+              HasMomentsNear(2.0, 0.06, std::sqrt(2.0), 0.06));
+}
+
+TEST(BetaDistributionTest, JoehnkNumericalStability) {
+  // Subnormal quantization on the direct pow path (1/alpha = 400 <= 500):
+  // u^400 == v^400 == DBL_TRUE_MIN, so direct x / (x + y) would return 0.5
+  // instead of ~1/3 from log space.
+  {
+    absl::random_internal::sequence_urbg urbg(
+        {0x27bf0fef76a3ce00ull, 0x27d0b5a68fa3ee00ull});
+    absl::beta_distribution<double> dist(0.0025, 0.0025);
+    EXPECT_THAT(dist(urbg), ::testing::DoubleNear(0.33333333333332027, 1e-12));
+  }
+
+  // Direct-pow bypass for large exponents (1/alpha = 1000 > 500):
+  // u^1000 == 0.0 and v^1000 == DBL_TRUE_MIN, so log space yields ~0.30098.
+  {
+    absl::random_internal::sequence_urbg urbg(
+        {0x7978d4fdf3b645a2ull, 0x79930be0ded288ceull});
+    absl::beta_distribution<double> dist(0.001, 0.001);
+    EXPECT_THAT(dist(urbg), ::testing::DoubleNear(0.30097958588233603, 1e-12));
+  }
+
+  // x - z cancellation: equal draws u == v == 0.5 must return 0.5 rather than
+  // 1.0 when |x| exceeds float/double precision relative to log(2).
+  {
+    absl::random_internal::sequence_urbg urbg(
+        {0x8000000000000000ull, 0x8000000000000000ull});
+    absl::beta_distribution<float> dist(1e-7f, 1e-7f);
+    EXPECT_THAT(dist(urbg), ::testing::FloatEq(0.5f));
+  }
+  {
+    absl::random_internal::sequence_urbg urbg(
+        {0x8000000000000000ull, 0x8000000000000000ull});
+    absl::beta_distribution<double> dist(1e-16, 1e-16);
+    EXPECT_THAT(dist(urbg), ::testing::DoubleEq(0.5));
+  }
+
+  // Skewed Joehnk: pow(v, 1/1e18) rounds to 1.0, so the direct path must not
+  // accept x + y <= 1.0. Scaled by 1e18, mean is 0.001 and stddev sqrt(0.001).
+  EXPECT_THAT(SampleScaledMoments<double>(0.001, 1e18, 1e18, 50000),
+              HasMomentsNear(0.001, 8e-4, std::sqrt(0.001), 0.03));
+
+  // Near-underflow tiny parameters: no -inf rejection truncation bias (true
+  // mean 1/11 ~ 0.0909, not 0.1374) and no -inf - (-inf) NaN when symmetric.
+  constexpr int kSamples = 20000;
+  EXPECT_THAT(SampleScaledMoments<double>(6e-309, 6e-308, 1.0, kSamples),
+              IsBernoulliNear(1.0 / 11.0, 0.01));
+  EXPECT_THAT(SampleScaledMoments<double>(6e-309, 6e-309, 1.0, kSamples),
+              IsBernoulliNear(0.5, 0.015));
+
+  // Unequal DEGENERATE_SMALL parameters follow Bernoulli(alpha / (alpha+beta))
+  // rather than collapsing to deterministic 0.0 / 1.0.
+  EXPECT_THAT(SampleScaledMoments<double>(1e-310, 2e-310, 1.0, kSamples),
+              IsBernoulliNear(1.0 / 3.0, 0.015));
+  EXPECT_THAT(SampleScaledMoments<double>(2e-310, 1e-310, 1.0, kSamples),
+              IsBernoulliNear(2.0 / 3.0, 0.015));
+}
+
+TEST(BetaDistributionTest, LongDoubleSmoke) {
+  if (absl::numeric_internal::IsDoubleDouble()) {
+    GTEST_SKIP() << "Skipping long double test on double-double platforms";
+  }
+  absl::random_internal::pcg64_2018_engine rng(0x2B7E151628AED2A6ULL);
+  const auto draw = [&rng](long double a, long double b) {
+    absl::beta_distribution<long double> dist(a, b);
+    return dist(rng);
+  };
+  const auto valid_unit =
+      ::testing::AllOf(::testing::Ge(0.0L), ::testing::Le(1.0L));
+  EXPECT_THAT(draw(0.1L, 0.2L), valid_unit);
+  EXPECT_THAT(draw(0.5L, 2.0L), valid_unit);
+  EXPECT_THAT(draw(2.0L, 5.0L), valid_unit);
+  EXPECT_THAT(static_cast<double>(draw(1e20L, 1e20L)),
+              ::testing::DoubleNear(0.5, 1e-8));
 }
 
 }  // namespace
