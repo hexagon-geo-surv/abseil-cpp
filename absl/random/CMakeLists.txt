@@ -507,6 +507,7 @@ absl_cc_test(
   LINKOPTS
     ${ABSL_DEFAULT_LINKOPTS}
   DEPS
+    absl::config
     absl::log
     absl::random_distributions
     absl::random_internal_distribution_test_util

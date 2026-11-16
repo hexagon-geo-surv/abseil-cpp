@@ -30,6 +30,10 @@
 namespace absl {
 ABSL_NAMESPACE_BEGIN
 
+namespace random_internal {
+struct ZipfDistributionTestPeer;
+}  // namespace random_internal
+
 // absl::zipf_distribution produces random integer-values in the range [0, k],
 // distributed according to the unnormalized discrete probability function:
 //
@@ -79,22 +83,35 @@ class zipf_distribution {
 
    private:
     friend class zipf_distribution;
-    inline double h(double x) const;
-    inline double hinv(double x) const;
-    inline double compute_s() const;
-    inline double pow_negative_q(double x) const;
+    friend struct random_internal::ZipfDistributionTestPeer;
 
-    // Parameters here are exactly the same as the parameters of Algorithm ZRI
-    // in the paper.
+    inline double log1p_ratio(double x) const;
+    inline double v_expm1(double t) const;
+    inline double scale_qm1_over_v(double delta) const;
+    inline double tail_integral(double x) const;
+    inline double tail_integral_inv(double d) const;
+    inline double compute_s() const;
+    inline double pow_negative_q(double k) const;
+
+    // Parameters for Algorithm ZRI expressed via the normalized tail integral
+    // D(x) = \int_x^{xm_} (1 + t / v)^(-q) dt, scaling the unnormalized PMF by
+    // v^q so f(0) = 1.0 and avoiding cancellation as q -> 1+, overflow when
+    // v < 1, underflow when q is steep, and subtraction of v at large v.
     IntType k_;
     double q_;
     double v_;
 
-    double one_minus_q_;  // 1-q
-    double s_;
-    double one_minus_q_inv_;  // 1 / 1-q
-    double hxm_;              // h(k + 0.5)
-    double hx0_minus_hxm_;    // h(x0) - h(k + 0.5)
+    double max_kd_;     // largest double <= k_
+    double qm1_;        // q - 1
+    double qm1_inv_;    // 1 / (q - 1)
+    double xm_;         // max_kd_ + 0.5
+    double zm_or_cm_;   // q == 2 ? cm_ : -(q - 1) * log(1 + xm_ / v), or 0 for
+                        // the linear limit D(x) = xm_ - x
+    double exp_zm_;     // q != 2: expm1(zm_) if zm >= -0.5 else exp(zm_)
+    double d0_;         // D(0)
+    double d0x5_;       // D(0.5)
+    double total_hat_;  // D(0.5) + f(0) == D(0.5) + 1.0
+    double s_;          // ZRI squeeze threshold, guaranteed in [0, 0.5)
 
     static_assert(random_internal::IsIntegral<IntType>::value,
                   "Class-template absl::zipf_distribution<> must be "
@@ -150,65 +167,261 @@ class zipf_distribution {
 template <typename IntType>
 zipf_distribution<IntType>::param_type::param_type(
     typename zipf_distribution<IntType>::result_type k, double q, double v)
-    : k_(k), q_(q), v_(v), one_minus_q_(1 - q) {
+    : k_(k), q_(q), v_(v), qm1_(q - 1.0) {
   assert(q > 1);
   assert(v > 0);
   assert(k >= 0);
-  one_minus_q_inv_ = 1 / one_minus_q_;
+  qm1_inv_ = 1.0 / qm1_;
 
-  // Setup for the ZRI algorithm (pg 17 of the paper).
-  // Compute: h(i max) => h(k + 0.5)
-  constexpr double kMax = 18446744073709549568.0;
-  double kd = static_cast<double>(k);
-  // TODO(absl-team): Determine if this check is needed, and if so, add a test
-  // that fails for k > kMax
-  if (kd > kMax) {
-    // Ensure that our maximum value is capped to a value which will
-    // round-trip back through double.
-    kd = kMax;
+  // Cap k to the largest IEEE-754 double <= k that round-trips into IntType
+  // without [conv.fpint] overflow or exceeding k_. Masking bits below the top
+  // double significand bits in integer arithmetic avoids x87 excess precision
+  // (FLT_EVAL_METHOD == 2) rounding max_kd_ above k_.
+  if constexpr (std::numeric_limits<IntType>::digits <=
+                std::numeric_limits<double>::digits) {
+    max_kd_ = static_cast<double>(k);
+  } else {
+    using UnsignedT = typename random_internal::MakeUnsigned<IntType>::type;
+    UnsignedT uk = (k > IntType{0}) ? static_cast<UnsignedT>(k) : UnsignedT{0};
+    const int width = random_internal::BitWidth(uk);
+    if (width > std::numeric_limits<double>::digits) {
+      const int shift = width - std::numeric_limits<double>::digits;
+      uk = (uk >> shift) << shift;
+    }
+    max_kd_ = static_cast<double>(uk);
   }
-  hxm_ = h(kd + 0.5);
+  xm_ = max_kd_ + 0.5;
 
-  // Compute: h(0)
-  const bool use_precomputed = (v == 1.0 && q == 2.0);
-  const double h0x5 = use_precomputed ? (-1.0 / 1.5)  // exp(-log(1.5))
-                                      : h(0.5);
-  const double elogv_q = (v_ == 1.0) ? 1 : pow_negative_q(v_);
+  if (q_ == 2.0) {
+    exp_zm_ = 0.0;
+    if (v_ >= 1.0) {
+      const double denom_m = 1.0 + (xm_ / v_);
+      zm_or_cm_ = 1.0 / denom_m;
+      d0_ = xm_ / denom_m;
+    } else {
+      const double v_plus_xm = v_ + xm_;
+      zm_or_cm_ = v_ / v_plus_xm;
+      d0_ = v_ * (xm_ / v_plus_xm);
+    }
+  } else {
+    const double log_xm = log1p_ratio(xm_);
+    if (q_ * log_xm <= 1e-40) {
+      // Across [0, xm_], (1 + t / v)^(-q) == 1.0 to > 130 bits. Use the exact
+      // linear limit D(x) = xm_ - x to avoid subnormal underflow in zm or
+      // (q - 1) / v * delta when q -> 1+ and v is near DBL_MAX.
+      zm_or_cm_ = 0.0;
+      exp_zm_ = 0.0;
+      d0_ = xm_;
+    } else {
+      const double zm = -qm1_ * log_xm;
+      zm_or_cm_ = zm;
+      double neg_expm1_zm;
+      if (zm >= -0.5) {
+        exp_zm_ = std::expm1(zm);
+        neg_expm1_zm = -exp_zm_;
+      } else {
+        exp_zm_ = (zm > -746.0) ? std::exp(zm) : 0.0;
+        neg_expm1_zm = 1.0 - exp_zm_;
+      }
+      d0_ = v_ * (neg_expm1_zm * qm1_inv_);
+    }
+  }
 
-  // h(0) = h(0.5) - exp(log(v) * -q)
-  hx0_minus_hxm_ = (h0x5 - elogv_q) - hxm_;
+  d0x5_ = tail_integral(0.5);
+  if (d0x5_ > d0_) {
+    d0x5_ = d0_;
+  }
+  total_hat_ = d0x5_ + 1.0;
 
-  // And s
-  s_ = use_precomputed ? 0.46153846153846123 : compute_s();
+  if (k == 0) {
+    s_ = 0.0;
+  } else if (v == 1.0 && q == 2.0) {
+    s_ = 0.46153846153846123;
+  } else {
+    s_ = compute_s();
+  }
 }
 
 template <typename IntType>
-double zipf_distribution<IntType>::param_type::h(double x) const {
-  // std::exp(one_minus_q_ * std::log(v_ + x)) * one_minus_q_inv_;
-  x += v_;
-  return (one_minus_q_ == -1.0)
-             ? (-1.0 / x)  // -exp(-log(x))
-             : (std::exp(std::log(x) * one_minus_q_) * one_minus_q_inv_);
+double zipf_distribution<IntType>::param_type::log1p_ratio(double x) const {
+  const double ratio = x / v_;
+  if (std::isfinite(ratio)) {
+    return std::log1p(ratio);
+  }
+  // When x / v_ overflows double, 1 + x / v_ == x / v_ to full precision.
+  return std::log(x) - std::log(v_);
 }
 
 template <typename IntType>
-double zipf_distribution<IntType>::param_type::hinv(double x) const {
-  // std::exp(one_minus_q_inv_ * std::log(one_minus_q_ * x)) - v_;
-  return -v_ + ((one_minus_q_ == -1.0)
-                    ? (-1.0 / x)  // exp(-log(-x))
-                    : std::exp(one_minus_q_inv_ * std::log(one_minus_q_ * x)));
+double zipf_distribution<IntType>::param_type::v_expm1(double t) const {
+  if (t <= 709.0) {
+    return v_ * std::expm1(t);
+  }
+  // When t > 709, exp(t) - 1 == exp(t) to full precision; combine logs to
+  // avoid premature overflow when v_ is very small.
+  return std::exp(std::log(v_) + t);
+}
+
+template <typename IntType>
+double zipf_distribution<IntType>::param_type::scale_qm1_over_v(
+    double delta) const {
+  if (v_ < 1.0) {
+    return (delta / v_) * qm1_;
+  }
+  if (qm1_ > 1e280) {
+    return (qm1_ / v_) * delta;
+  }
+  return (qm1_ * delta) / v_;
+}
+
+template <typename IntType>
+double zipf_distribution<IntType>::param_type::tail_integral(double x) const {
+  if (x >= xm_) {
+    return 0.0;
+  }
+  if (q_ == 2.0) {
+    const double dx = xm_ - x;
+    if (v_ >= 1.0) {
+      return (dx / (1.0 + (x / v_))) * zm_or_cm_;
+    }
+    return (dx * (v_ / (v_ + x))) * zm_or_cm_;
+  }
+  if (zm_or_cm_ == 0.0) {
+    return xm_ - x;
+  }
+  const double zx = -qm1_ * log1p_ratio(x);
+  if (zx < -746.0) {
+    return 0.0;
+  }
+  const double exp_zx = std::exp(zx);
+  const double neg_expm1_diff = -std::expm1(zm_or_cm_ - zx);
+  if (v_ >= 1.0) {
+    return exp_zx * (v_ * (neg_expm1_diff * qm1_inv_));
+  }
+  return (v_ * exp_zx) * (neg_expm1_diff * qm1_inv_);
+}
+
+template <typename IntType>
+double zipf_distribution<IntType>::param_type::tail_integral_inv(
+    double d) const {
+  if (d <= 0.0) {
+    return xm_;
+  }
+  if (q_ == 2.0) {
+    if (d >= d0_) {
+      return 0.0;
+    }
+    return (d0_ - d) / (zm_or_cm_ + (d / v_));
+  }
+  if (zm_or_cm_ == 0.0) {
+    return (d >= d0_) ? 0.0 : (d0_ - d);
+  }
+
+  double z;
+  if (d >= 0.5 * d0_) {
+    // When d is in the upper half of [0, D(0)], d0_ - d is exact by Sterbenz's
+    // lemma and u = (q - 1) / v * (D(0) - d) <= 0.5, avoiding catastrophic
+    // cancellation of exp(zm_) + b near 1.0 when x << v << xm_.
+    const double delta = d0_ - d;
+    if (delta <= 0.0) {
+      return 0.0;
+    }
+    const double u = scale_qm1_over_v(delta);
+    if (u >= 1.0) {
+      return xm_;
+    }
+    z = std::log1p(-u);
+  } else {
+    const double b = scale_qm1_over_v(d);
+    if (zm_or_cm_ >= -0.5) {
+      const double s = exp_zm_ + b;
+      if (s <= -1.0) return xm_;
+      if (s >= 0.0) return 0.0;
+      z = std::log1p(s);
+    } else if (zm_or_cm_ >= -708.0) {
+      const double val = exp_zm_ + b;
+      if (val >= 1.0) return 0.0;
+      z = std::log(val);
+    } else if (b == 0.0) {
+      z = zm_or_cm_;
+    } else {
+      const double lb = std::log(b);
+      if (lb >= zm_or_cm_) {
+        z = lb + std::log1p(std::exp(zm_or_cm_ - lb));
+      } else {
+        z = zm_or_cm_ + std::log1p(std::exp(lb - zm_or_cm_));
+      }
+    }
+  }
+  return v_expm1(-z * qm1_inv_);
 }
 
 template <typename IntType>
 double zipf_distribution<IntType>::param_type::compute_s() const {
-  // 1 - hinv(h(1.5) - std::exp(std::log(v_ + 1) * -q_));
-  return 1.0 - hinv(h(1.5) - pow_negative_q(v_ + 1.0));
+  // Solve \int_{1 - s}^{1.5} (v + x)^(-q) dx = (v + 1)^(-q) directly on
+  // [1 - s, 1.5] with y = v + 1, independent of xm_. With r = 1 / y and
+  // q1 = q - 1 > 0:
+  //   (1 - s * r)^(-q1) = (1 + 0.5 * r)^(-q1) + q1 * r.
+  // Because s(k) increases with k >= 1 and 0 < s(1) < 0.5, stepping down below
+  // transcendental rounding error and clamping to [0, nextafter(0.5, 0)) gives
+  // a sound squeeze threshold for all k >= 1 and ensures k - x == 0 <= s_ for
+  // all x >= 2^52 (where every double is an integer, and k + 0.5 == k for
+  // k >= 2^53).
+  const double y = v_ + 1.0;
+  double s;
+  if (q_ == 2.0) {
+    const double r = 1.0 / y;
+    s = (0.5 * (1.0 + r)) / (1.0 + r * (1.0 + 0.5 * r));
+  } else if (q_ / y <= 1e-8) {
+    // For q / y <= 1e-8, 0.5 - s_exact < 0.085 * (q / y)^2 < 1e-17 < 2^-54,
+    // avoiding subnormal underflow of qm1_ / y when v_ is huge and q_ -> 1+.
+    s = std::nextafter(0.5, 0.0);
+  } else {
+    const double qr = qm1_ / y;
+    if (!std::isfinite(qr) || qr >= 1e300) {
+      // (1 + 0.5 / y)^(-qm1_) <= 1 is negligible relative to qr >= 1e300.
+      const double log_lhs_over_qm1 = (std::log(qm1_) - std::log(y)) / qm1_;
+      s = -y * std::expm1(-log_lhs_over_qm1);
+    } else if (y >= 1e100) {
+      // 0.5 / y <= 5e-101 so log1p(0.5 / y) == 0.5 / y and
+      // log1p(a) / qm1_ < 1e-89, avoiding subnormal underflow at huge v_.
+      const double a = std::expm1(-0.5 * qr) + qr;
+      s = std::log1p(a) / qr;
+    } else {
+      const double a = std::expm1(-qm1_ * std::log1p(0.5 / y)) + qr;
+      const double log_lhs_over_qm1 = std::log1p(a) / qm1_;
+      s = -y * std::expm1(-log_lhs_over_qm1);
+    }
+  }
+
+  if (!std::isfinite(s) || s <= 0.0) {
+    return 0.0;
+  }
+  constexpr double kSafetyFactor =
+      1.0 - 8.0 * std::numeric_limits<double>::epsilon();
+  s = std::nextafter(s * kSafetyFactor, 0.0);
+  const double max_s = std::nextafter(0.5, 0.0);
+  if (s > max_s) {
+    s = max_s;
+  }
+  return (s > 0.0) ? s : 0.0;
 }
 
 template <typename IntType>
-double zipf_distribution<IntType>::param_type::pow_negative_q(double x) const {
-  // std::exp(std::log(x) * -q_);
-  return q_ == 2.0 ? (1.0 / (x * x)) : std::exp(std::log(x) * -q_);
+double zipf_distribution<IntType>::param_type::pow_negative_q(double k) const {
+  if (k == 0.0) {
+    return 1.0;
+  }
+  if (q_ == 2.0) {
+    if (v_ >= 1.0) {
+      const double one_plus = 1.0 + (k / v_);
+      return 1.0 / (one_plus * one_plus);
+    }
+    const double r = v_ / (v_ + k);
+    return r * r;
+  }
+  const double arg = -q_ * log1p_ratio(k);
+  return (arg > -746.0) ? std::exp(arg) : 0.0;
 }
 
 template <typename IntType>
@@ -219,15 +432,30 @@ zipf_distribution<IntType>::operator()(
   absl::uniform_real_distribution<double> uniform_double;
   double k;
   for (;;) {
-    const double v = uniform_double(g);
-    const double u = p.hxm_ + v * p.hx0_minus_hxm_;
-    const double x = p.hinv(u);
-    k = rint(x);                                   // std::floor(x + 0.5);
-    if (k > static_cast<double>(p.k())) continue;  // reject k > max_k
-    if (k - x <= p.s_) break;
-    const double h = p.h(k + 0.5);
-    const double r = p.pow_negative_q(p.v_ + k);
-    if (u >= h - r) break;
+    const double w = uniform_double(g);
+    const double d = w * p.total_hat_;
+    if (d >= p.d0x5_) {
+      return 0;
+    }
+    const double x = p.tail_integral_inv(d);
+    k = std::rint(x);
+    if (k < 1.0) {
+      // d >= p.d0x5_ already accounts for the full mass of k = 0; clamping to
+      // k = 1 prevents double-counting k = 0 if rounding yields x <= 0.5, and
+      // since k - x >= 0.5 > p.s_ it falls through to the exact rejection test.
+      k = 1.0;
+    }
+    if (!(k >= 1.0 && k <= p.max_kd_)) {
+      continue;
+    }
+    if (k - x <= p.s_) {
+      break;
+    }
+    const double dk = p.tail_integral(k + 0.5);
+    const double rk = p.pow_negative_q(k);
+    if (d <= dk + rk) {
+      break;
+    }
   }
   IntType ki = static_cast<IntType>(k);
   assert(ki <= p.k_);
