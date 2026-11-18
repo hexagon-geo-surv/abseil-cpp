@@ -236,6 +236,13 @@ namespace absl {
 ABSL_NAMESPACE_BEGIN
 namespace container_internal {
 
+template <class T>
+struct IsCharArray : std::false_type {};
+template <size_t N>
+struct IsCharArray<char[N]> : std::true_type {};
+template <size_t N>
+struct IsCharArray<const char[N]> : std::true_type {};
+
 #ifdef ABSL_SWISSTABLE_ENABLE_GENERATIONS
 #error ABSL_SWISSTABLE_ENABLE_GENERATIONS cannot be directly set
 #elif (defined(ABSL_HAVE_ADDRESS_SANITIZER) ||   \
@@ -4044,7 +4051,13 @@ class raw_hash_set : public raw_hash_set_base {
   struct EmplaceDecomposable {
     template <class K, class... Args>
     std::pair<iterator, bool> operator()(const K& key, Args&&... args) const {
-      auto res = s.find_or_prepare_insert<KeyParam<K>>(key);
+      using Param = std::conditional_t<
+          std::is_convertible_v<const K&, KeyParam<const_key_arg<K>>>,
+          // Convert once when implicitly convertible.
+          KeyParam<const_key_arg<K>>,
+          // Keep K for lazy explicit proxies.
+          KeyParam<K>>;
+      auto res = s.find_or_prepare_insert<Param>(key);
       if (res.second) {
         s.emplace_at(res.first, std::forward<Args>(args)...);
       }
@@ -4367,9 +4380,20 @@ class raw_hash_set : public raw_hash_set_base {
   }
 
  protected:
+  static constexpr bool kIsStringAbslHashEq =
+      std::is_same_v<hasher, absl::container_internal::StringHash> &&
+      std::is_same_v<key_equal, absl::container_internal::StringEq>;
+
+  // Collapse char[N] keys of different lengths to absl::string_view to avoid
+  // per-length instantiations and repeated strlen calls.
+  template <class K, class RemoveCvrefK = absl::remove_cvref_t<K>>
+  using CanonicalKey = std::conditional_t<kIsStringAbslHashEq &&
+                                              IsCharArray<RemoveCvrefK>::value,
+                                          absl::string_view, RemoveCvrefK>;
+
   template <class K>
-  using KeyParam = type_traits_internal::AddConstRefIfExpensiveToCopy<
-      absl::remove_cvref_t<K>>;
+  using KeyParam =
+      type_traits_internal::AddConstRefIfExpensiveToCopy<CanonicalKey<K>>;
 
   // Asserts for correctness that we run on find/find_or_prepare_insert.
   template <class K>
@@ -4395,9 +4419,6 @@ class raw_hash_set : public raw_hash_set_base {
     // validation. This improves debug performance, but also is important for
     // correctness of the *ConversionCount tests, which fail if we call hash/eq
     // on the lookup keys extra times (which triggers additional conversions).
-    constexpr bool kIsStringAbslHashEq =
-        std::is_same_v<hasher, absl::container_internal::StringHash> &&
-        std::is_same_v<key_equal, absl::container_internal::StringEq>;
     constexpr bool kIsScalarAbslHashEq =
         std::is_scalar_v<key_type> &&
         std::is_same_v<hasher, typename HashEq<key_type>::Hash> &&
@@ -4493,8 +4514,7 @@ class raw_hash_set : public raw_hash_set_base {
   // explicitly.)
   template <class K, class RemoveCvrefK = absl::remove_cvref_t<K>,
             bool IsStringHashEqAndConvertibleToStringView =
-                std::is_same_v<hasher, absl::container_internal::StringHash> &&
-                std::is_same_v<key_equal, absl::container_internal::StringEq> &&
+                kIsStringAbslHashEq &&
                 std::is_convertible_v<const RemoveCvrefK&, absl::string_view>,
             class Ptr = std::remove_pointer_t<key_type>*,
             class ConstPtr = const std::remove_pointer_t<key_type>*,

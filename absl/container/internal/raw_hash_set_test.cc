@@ -79,6 +79,8 @@ ABSL_NAMESPACE_BEGIN
 namespace container_internal {
 
 struct RawHashSetTestOnlyAccess {
+  template <typename C, typename K>
+  using KeyParam = typename C::raw_hash_set::template KeyParam<K>;
   template <typename C>
   static auto GetCommon(C&& c) -> decltype(std::forward<C>(c).common()) {
     return std::forward<C>(c).common();
@@ -3156,17 +3158,15 @@ void TestDecomposeNonTransparent() {
   set.insert(DecomposeType{2});
 
   decompose_constructed = 0;
-  // Miss converts for lookup and constructs once in the slot.
+  // Miss converts once for lookup and constructs once in the slot.
   set.insert(1);
-  EXPECT_GE(decompose_constructed, 2);
+  EXPECT_EQ(decompose_constructed, 2);
 
   const int one = 1;
-  // TODO(b/413633804): Tighten to EXPECT_EQ(..., 1) once EmplaceDecomposable
-  // converts non-transparent keys at the lookup boundary.
   auto check_hit = [&](absl::FunctionRef<void(Set&, int)> fn) {
     decompose_constructed = 0;
     fn(set, one);
-    EXPECT_GE(decompose_constructed, 1);
+    EXPECT_EQ(decompose_constructed, 1);
   };
   check_hit([](Set& s, int) { s.insert(1); });
   check_hit([](Set& s, int v) { s.insert(v); });
@@ -3203,6 +3203,59 @@ TEST(Table, EmplaceHeterogeneousKeyHitDoesNotMoveValue) {
   EXPECT_FALSE(m.emplace(1, std::move(p)).second);
   EXPECT_NE(p, nullptr);
   EXPECT_EQ(*m[1], 42);
+}
+
+TEST(Table, EmplaceExplicitlyConvertibleKeyWithTemplatedFunctors) {
+  struct Key {
+    int v;
+  };
+  struct ExplicitProxy {
+    int v;
+    int* conversions;
+    explicit operator Key() const {
+      ++*conversions;
+      return Key{v};
+    }
+  };
+  struct TemplatedHash {
+    size_t operator()(const Key& k) const { return static_cast<size_t>(k.v); }
+    size_t operator()(const ExplicitProxy& p) const {
+      return static_cast<size_t>(p.v);
+    }
+  };
+  struct TemplatedEq {
+    bool operator()(const Key& a, const Key& b) const { return a.v == b.v; }
+    bool operator()(const Key& a, const ExplicitProxy& b) const {
+      return a.v == b.v;
+    }
+    bool operator()(const ExplicitProxy& a, const Key& b) const {
+      return a.v == b.v;
+    }
+  };
+
+  absl::flat_hash_set<Key, TemplatedHash, TemplatedEq> set;
+  int conversions = 0;
+  EXPECT_TRUE(set.emplace(ExplicitProxy{42, &conversions}).second);
+  EXPECT_EQ(conversions, 1);
+  EXPECT_FALSE(set.emplace(ExplicitProxy{42, &conversions}).second);
+  EXPECT_EQ(conversions, 1);
+}
+
+TEST(Table, CharArrayKeyParamCanonicalizesToStringView) {
+  using StringMap = absl::flat_hash_map<std::string, int>;
+  EXPECT_TRUE((std::is_same_v<
+               RawHashSetTestOnlyAccess::KeyParam<StringMap, const char (&)[4]>,
+               absl::string_view>));
+  EXPECT_TRUE((std::is_same_v<
+               RawHashSetTestOnlyAccess::KeyParam<StringMap, char (&)[64]>,
+               absl::string_view>));
+
+  StringMap m = {{"abc", 1}};
+  char buf[64] = "abc";
+  EXPECT_EQ(m.find("abc")->second, 1);
+  EXPECT_EQ(m.find(buf)->second, 1);
+  EXPECT_FALSE(m.try_emplace(buf, 2).second);
+  EXPECT_FALSE(m.emplace(buf, 2).second);
 }
 
 TEST(Table, DecomposeRangeInsert) {
